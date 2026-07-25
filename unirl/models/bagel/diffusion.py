@@ -285,18 +285,37 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             return torch.autocast("cuda", self.autocast_dtype)
         return nullcontext()
 
-    def _build_contexts_from_prompt(self, prompt: str) -> Tuple[Any, Any, Any]:
-        """Rebuild the three KV contexts (gen / cfg_text / cfg_img) from a prompt.
+    def _build_contexts_from_prompt(self, prompt: str, image: Optional[Any] = None) -> Tuple[Any, Any, Any]:
+        """Rebuild the three KV contexts (gen / cfg_text / cfg_img) from raw material.
 
-        The vllm_omni rollout path ships only the prompt text (KV caches can't
-        cross the worker→driver IPC boundary), so replay rebuilds the contexts
-        here on the trainer's own bundle. Mirrors
-        ``BagelPipeline._build_contexts`` (think=False, no image): ``cfg_text`` is
-        the init snapshot taken BEFORE the prompt text (unconditional); ``gen``
-        and ``cfg_img`` both ingest the prompt. The und/text path is frozen, so
-        the rebuilt contexts equal those the rollout worker used.
+        The vllm_omni rollout path ships only the RAW conditioning — the prompt
+        text plus, for it2i, the source PIL (KV caches can't cross the
+        worker→driver IPC boundary) — so replay rebuilds the contexts here on the
+        trainer's own bundle. Mirrors ``BagelPipeline._build_contexts``
+        (think=False; editing input order ``[image, text]``)::
+
+            t2i  (image=None): gen      = init + text
+                               cfg_text = init                  (unconditional)
+                               cfg_img  = init + text           (no image branch)
+            it2i (image set):  gen      = init + image(VAE+ViT) + text
+                               cfg_text = init + image          (drop-text branch)
+                               cfg_img  = init + text           (drop-image branch)
+
+        For t2i the und/text prefill is frozen, so the rebuilt contexts equal those
+        the rollout worker used. it2i additionally requires the worker to prefill
+        the source image through the SAME ``rl_ops`` helpers this rebuild calls —
+        the worker's own img2img preprocessing (a stride-``latent_downsample``
+        resize + ``SiglipImageProcessor``) does NOT match the vendored
+        ``ImageTransform`` pair used here, so a worker that runs it would condition
+        rollout on different pixels than replay.
         """
         from copy import deepcopy
+
+        if image is not None and getattr(self.model.model, "vit_model", None) is None:
+            raise ValueError(
+                "BagelDiffusionStage: the conditions carry an it2i source image but the bundle "
+                "was built without the und ViT; set BagelPipelineConfig.enable_vit=true."
+            )
 
         inf = self.model.inferencer
         device = torch.device(self.model.device)
@@ -309,8 +328,14 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        with torch.no_grad(), self._autocast_ctx(device):
-            cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
+        # Force eval: this rebuild runs inside ``replay``, and the train stack has the
+        # MoT in train() mode by then — under which the navit dispatch sends these
+        # packed-inference prefills into ``forward_train``.
+        with rl_ops.inference_dispatch_scope(self.model.model), torch.no_grad(), self._autocast_ctx(device):
+            if image is not None:
+                resized = rl_ops.resize_input_image(self.model, image)
+                gen = rl_ops.update_context_image(self.model, resized, gen, vae=True, vit=True)
+            cfg_text = deepcopy(gen)  # snapshot before the prompt text → drop-text branch
             gen = inf.update_context_text(clean_prompt, gen)
             cfg_img = inf.update_context_text(clean_prompt, cfg_img)
         return gen, cfg_text, cfg_img
@@ -322,14 +347,14 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
         - **opaque contexts present** (trainside / colocate): return them directly
           via :meth:`BagelDiffusionConditions.single`.
-        - **deferred prompts only** (vllm_omni cross-process): rebuild the KV
-          contexts from the shipped prompt on this bundle (the und path is frozen
-          → identical contexts), then return them.
+        - **deferred raw material only** (vllm_omni cross-process): rebuild the KV
+          contexts from the shipped prompt — plus the source image for it2i — on
+          this bundle, then return them.
         """
         if conditions.has_contexts():
             return conditions.single()
-        prompt, image_shape = conditions.single_prompt()
-        gen, cfg_text, cfg_img = self._build_contexts_from_prompt(prompt)
+        prompt, input_image, image_shape = conditions.single_prompt()
+        gen, cfg_text, cfg_img = self._build_contexts_from_prompt(prompt, input_image)
         return gen, cfg_text, cfg_img, image_shape
 
     def _build_generation_inputs(

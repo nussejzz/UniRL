@@ -1,8 +1,10 @@
-"""BAGEL-7B-MoT family: input/output sub-adapters + the ``bagel_t2i`` modality class.
+"""BAGEL-7B-MoT family: input/output sub-adapters + the t2i / it2i modality classes.
 
 Single diffusion stage (the BAGEL single-stage topology, where the DiT worker
-owns its own LLM/ViT/VAE/tokenizer), TP=1, no AR prelude. BAGEL forces two
-deviations from the shared DiT skeleton — everything else is reused:
+owns its own LLM/ViT/VAE/tokenizer), TP=1, no AR prelude. That one worker serves
+every BAGEL modality, so t2i and it2i boot the SAME stage YAML and differ only in
+what the request carries. BAGEL forces two deviations from the shared DiT skeleton
+— everything else is reused:
 
 - **σ off-by-one.** BAGEL's ``generate_image`` builds its σ schedule internally
   from ``num_timesteps`` and loops ``num_timesteps - 1`` steps (``linspace(1, 0,
@@ -32,6 +34,14 @@ deviations from the shared DiT skeleton — everything else is reused:
   frozen, the rebuilt contexts are identical regardless of the gen-LoRA state).
   This is the load-bearing difference from SD3 / Qwen-Image, which ship dense
   text embeds captured by an ``encode_prompt`` tap.
+
+``bagel_it2i`` (editing) layers one more thing on top: the per-sample SOURCE image
+rides BOTH sides of the request. On the way out it goes on the prompt dict under
+``multi_modal_data["image"]`` (the key upstream's img2img branch reads); on the way
+back it goes onto the deferred conditions as ``input_images``, because the trainer's
+context rebuild has to prefill the same source image the worker did. Packed rollout
+is forced OFF for it2i — upstream's grouped ``generate_image`` is cfg=1 t2i only —
+so editing runs one request per sample.
 """
 
 from __future__ import annotations
@@ -51,6 +61,7 @@ from unirl.rollout.engine.vllm_omni.utils import (
     build_image_segment,
     collect_dit_outputs,
     grouped_texts_from_req,
+    pil_images_from_req,
     pils_to_images,
     texts_from_req,
 )
@@ -62,7 +73,16 @@ from unirl.types.rollout_resp import RolloutResp
 
 
 class BagelInputAdapter(DitInputAdapter):
-    """Request side: prompt dicts + the BAGEL diffusion-stage sampling intent."""
+    """Request side: prompt dicts + the BAGEL diffusion-stage sampling intent.
+
+    ``image_input`` is the it2i (editing) switch: the request must carry
+    ``primitives['image']``, each prompt dict gets its own source PIL, and packed
+    rollout is disabled.
+    """
+
+    def __init__(self, modality: str, *, image_input: bool = False) -> None:
+        super().__init__(modality)
+        self.image_input = bool(image_input)
 
     def _spp(self, req: RolloutReq) -> int:
         """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
@@ -72,8 +92,11 @@ class BagelInputAdapter(DitInputAdapter):
         """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request.
 
         Mirrors ``RLBagelPipeline._is_batchable_t2i``: packed ``generate_image``
-        is cfg=1 t2i only. CFG>1 keeps the sample-level layout.
+        is cfg=1 t2i only — an image-bearing request is rejected there, so it2i
+        must stay at the sample-level layout. CFG>1 also keeps it.
         """
+        if self.image_input:
+            return False
         if self._spp(req) <= 1:
             return False
         diff_params = req.sampling_params.get("diffusion")
@@ -88,13 +111,22 @@ class BagelInputAdapter(DitInputAdapter):
         — the trainside oracle runs cfg=1 (the negative text branch is unused at
         cfg_text_scale=1.0), and the CFG scales ride ``extra_args`` instead.
 
-        When packable, each prompt's spp samples collapse to ONE request
+        it2i adds ``multi_modal_data={"image": pil}`` per sample — the key
+        upstream's img2img branch reads to prefill the source image into the gen
+        and cfg_text contexts. One request per sample (packing is off).
+
+        For t2i, when packable, each prompt's spp samples collapse to ONE request
         (``num_outputs_per_prompt=spp``). Otherwise keep one request per sample.
         """
+        texts = texts_from_req(req)
+        if self.image_input:
+            pil_images = pil_images_from_req(req, len(texts.texts))
+            if not pil_images:
+                raise ValueError(f"modality={self.modality!r} requires req.primitives['image']")
+            return [{"prompt": text, "multi_modal_data": {"image": pil}} for text, pil in zip(texts.texts, pil_images)]
         if req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
         if not self._is_packable_t2i(req):
-            texts = texts_from_req(req)
             return [{"prompt": text} for text in texts.texts]
         grouped_texts, _ = grouped_texts_from_req(
             req,
@@ -169,7 +201,15 @@ class BagelInputAdapter(DitInputAdapter):
 
 
 class BagelOutputAdapter(DitOutputAdapter):
-    """Response side: one ``"image"`` track with prompt-carrying conditions."""
+    """Response side: one ``"image"`` track with prompt-carrying conditions.
+
+    ``image_input`` is the it2i switch: the deferred conditions additionally carry
+    the per-sample source image the trainer's context rebuild needs.
+    """
+
+    def __init__(self, modality: str, *, image_input: bool = False) -> None:
+        super().__init__(modality)
+        self.image_input = bool(image_input)
 
     def build_segments(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """The DiT trajectory segment (asserts the σ echo). No AR sweep (BAGEL
@@ -187,12 +227,22 @@ class BagelOutputAdapter(DitOutputAdapter):
         return {self.track_name: pils_to_images(pil_images)}
 
     def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Ship the PROMPTS (deferred conditions) for trainer-side KV rebuild.
+        """Ship the RAW conditioning (deferred conditions) for trainer-side KV rebuild.
 
         BAGEL KV contexts can't cross the IPC boundary, so instead of capturing
-        embeds we carry the prompt text + per-sample image shape. The trainer's
-        :class:`BagelDiffusionStage` rebuilds the three KV contexts on its own
-        bundle at replay (the und/text path is frozen → identical contexts).
+        embeds we carry the prompt text + per-sample image shape — plus, for it2i,
+        the source image. The trainer's :class:`BagelDiffusionStage` rebuilds the
+        three KV contexts on its own bundle at replay (the und/text path is frozen
+        → identical contexts).
+
+        ``image_shape`` stays the REQUESTED ``height`` / ``width``, not the source
+        image's own dims: BAGEL editing renders a fresh canvas of the requested
+        size, and that shape is what the driver's x_T recipe was authored for.
+
+        The it2i source PILs are re-derived from the request here rather than
+        threaded over from ``build_prompts``. ``Images.to_pils`` is a pure function
+        of the stored pixel tensor, so the trainer's copy is byte-identical to the
+        one the worker received.
         """
         del per_request
         texts = texts_from_req(req)
@@ -201,24 +251,32 @@ class BagelOutputAdapter(DitOutputAdapter):
         prompts = list(texts.texts)
         conditions = BagelDiffusionConditions(
             prompts=prompts,
+            input_images=pil_images_from_req(req, len(prompts)) if self.image_input else [],
             image_shapes=[image_shape] * len(prompts),
         )
         return conditions.to_dict()
 
 
-@register_adapter("bagel_t2i")
-class BagelT2iAdapter(ModelAdapter):
-    """BAGEL-7B-MoT text → image (single diffusion stage, TP=1)."""
+class BagelAdapter(ModelAdapter):
+    """Shared BAGEL binder: one single-stage DiT worker, TP=1, no AR prelude.
+
+    The two registered modalities are pure identity rows on top of this — the
+    stage YAML, σ policy and conversion verbs are family-wide, and
+    :attr:`image_input` is the only axis they differ on.
+    """
 
     stage_yaml = "bagel_t2i_rl.yaml"
     omni_mode = "text-to-image"
     # The BAGEL single-stage DiT worker owns its tokenizer; the driver loads none.
     needs_driver_tokenizer = False
+    #: The modality REQUIRES ``req.primitives['image']`` (it2i editing) rather than
+    #: rejecting it (t2i). Drives the sub-adapters' image branches.
+    image_input: bool = False
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
-        self.input_adapter = BagelInputAdapter(self.modality)
-        self.output_adapter = BagelOutputAdapter(self.modality)
+        self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input)
+        self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input)
 
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting).
@@ -233,9 +291,15 @@ class BagelT2iAdapter(ModelAdapter):
         return FlowMatchSchedulePolicy.static_only(shift)
 
     def validate_request(self, req: RolloutReq) -> None:
-        if req.primitives.get("image") is not None:
+        has_image = req.primitives.get("image") is not None
+        if self.image_input and not has_image:
             raise ValueError(
-                f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
+                f"modality={self.modality!r} requires req.primitives['image'] (the edit source); "
+                "use modality='bagel_t2i' for prompt-only generation."
+            )
+        if not self.image_input and has_image:
+            raise ValueError(
+                f"modality={self.modality!r} rejects image-bearing requests; use modality='bagel_it2i' instead."
             )
 
     def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
@@ -245,4 +309,16 @@ class BagelT2iAdapter(ModelAdapter):
         return self.output_adapter.build(req, per_request)
 
 
-__all__ = ["BagelInputAdapter", "BagelOutputAdapter", "BagelT2iAdapter"]
+@register_adapter("bagel_t2i")
+class BagelT2iAdapter(BagelAdapter):
+    """BAGEL-7B-MoT text → image."""
+
+
+@register_adapter("bagel_it2i")
+class BagelIt2iAdapter(BagelAdapter):
+    """BAGEL-7B-MoT text + source image → edited image (editing / it2i)."""
+
+    image_input = True
+
+
+__all__ = ["BagelAdapter", "BagelInputAdapter", "BagelIt2iAdapter", "BagelOutputAdapter", "BagelT2iAdapter"]

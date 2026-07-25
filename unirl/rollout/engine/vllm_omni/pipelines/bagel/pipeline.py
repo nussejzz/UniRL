@@ -5,18 +5,35 @@ install the trajectory-capturing SDE scheduler + noise tap + fp32 RoPE/RMSNorm
 patches, arm per-request x_T/SDE, delegate to upstream, then harvest the trajectory.
 Conditioning is NOT tapped — the driver ships prompts and the trainer rebuilds the
 (frozen) KV contexts at replay. Loaded in vLLM-Omni's worker via custom_pipeline_args.
+
+t2i delegates its prefill to upstream untouched. **it2i (editing) does not**: this
+subclass builds the three KV contexts itself — through the same
+:mod:`unirl.models.bagel.rl_ops` helpers the trainer replays with — and hands them to
+upstream via its injected-KV channel, which makes upstream skip its own img2img
+prefill entirely. See :meth:`RLBagelPipeline._inject_it2i_contexts` for why upstream's
+version cannot be used as-is (it overrides the output canvas and preprocesses the
+source image differently from the vendored transforms).
 """
 
 from __future__ import annotations
 
+import copy
 import logging
-from typing import Any, Dict, Optional
+from types import SimpleNamespace
+from typing import Any, Dict, Optional, Tuple
 
+import PIL.Image
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
+from unirl.models.bagel.rl_ops import (
+    build_image_transforms,
+    resize_input_image,
+    update_context_image,
+)
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     drain_trajectory_into,
     resolve_request_noise,
@@ -50,6 +67,10 @@ class RLBagelPipeline(BagelPipeline):
         self._pending_batched_latents: Optional[list] = None
         # Stored trajectory dtype (matches trainside trajectory_precision).
         self._trajectory_dtype: torch.dtype = torch.float32
+        # Canonical (vae, vit) source-image transforms for it2i; built on first use
+        # so the pure-t2i path never touches the vendored transform module.
+        self._vae_transform: Optional[Any] = None
+        self._vit_transform: Optional[Any] = None
 
     # ------------------------------------------------------------------ #
     # install — once per pipeline lifetime, idempotent
@@ -243,6 +264,148 @@ class RLBagelPipeline(BagelPipeline):
         self._generate_image_tap_installed = True
 
     # ------------------------------------------------------------------ #
+    # it2i conditioning — built HERE, not by upstream
+    # ------------------------------------------------------------------ #
+
+    def _bundle_view(self) -> SimpleNamespace:
+        """A ``BagelBundle``-shaped view of this worker.
+
+        Lets :func:`unirl.models.bagel.rl_ops.update_context_image` — the very
+        function the trainside pipeline prefills with and the replay stage rebuilds
+        with — run verbatim here, so the source-image prefill is literally the same
+        code on both sides of the loop rather than a reimplementation that can drift.
+        """
+        if self._vae_transform is None:
+            self._vae_transform, self._vit_transform = build_image_transforms()
+        return SimpleNamespace(
+            model=self.bagel,
+            vae=self.vae,
+            vae_transform=self._vae_transform,
+            vit_transform=self._vit_transform,
+            new_token_ids=self.new_token_ids,
+            device=self.device,
+        )
+
+    @staticmethod
+    def _prompt_text(req: OmniDiffusionRequest) -> str:
+        """The request's prompt string (upstream's own extraction, pipeline_bagel:327)."""
+        prompt = req.prompts[0]
+        return prompt if isinstance(prompt, str) else (prompt.get("prompt") or "")
+
+    @staticmethod
+    def _source_image(req: OmniDiffusionRequest) -> Optional[PIL.Image.Image]:
+        """The it2i source PIL off the prompt dict; ``None`` on the t2i path."""
+        prompt = req.prompts[0] if getattr(req, "prompts", None) else None
+        if not isinstance(prompt, dict):
+            return None
+        image = (prompt.get("multi_modal_data") or {}).get("image")
+        if image is None:
+            return None
+        if not isinstance(image, PIL.Image.Image):
+            raise TypeError(
+                "RLBagelPipeline: multi_modal_data['image'] must be ONE PIL image "
+                f"(BagelInputAdapter ships one per sample); got {type(image).__name__}."
+            )
+        return image
+
+    def _prefill_text(self, ctx: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+        """Advance a KV context by one text split — upstream's text prefill, verbatim.
+
+        The same ``prepare_prompts`` + ``forward_cache_update_text`` pair and the same
+        ``<|im_start|>`` / ``<|im_end|>`` strip upstream's own branch runs, so taking
+        the prefill over does not change how prompts are tokenized. Caller owns
+        no_grad + autocast.
+        """
+        clean = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+        gi, kv_lens, ropes = self.bagel.prepare_prompts(
+            curr_kvlens=ctx["kv_lens"],
+            curr_rope=ctx["ropes"],
+            prompts=[clean],
+            tokenizer=self.tokenizer,
+            new_token_ids=self.new_token_ids,
+        )
+        gi = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in gi.items()}
+        past = self.bagel.forward_cache_update_text(ctx["past_key_values"], **gi)
+        return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
+
+    def _build_it2i_contexts(
+        self, image: PIL.Image.Image, prompt: str
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """The three editing KV contexts, in the trainside order::
+
+            gen      = init + image(VAE+ViT) + text
+            cfg_text = init + image                  (drop-text branch)
+            cfg_img  = init + text                   (drop-image branch)
+
+        Same topology as ``BagelPipeline._build_contexts`` /
+        ``BagelDiffusionStage._build_contexts_from_prompt`` — and, because the image
+        half routes through ``rl_ops``, the same source-image pixels as well.
+        """
+        bundle = self._bundle_view()
+        gen = {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
+        }
+        cfg_img = copy.deepcopy(gen)
+        autocast = torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        )
+        with torch.no_grad(), autocast:
+            resized = resize_input_image(bundle, image)
+            gen = update_context_image(bundle, resized, gen, vae=True, vit=True)
+            cfg_text = copy.deepcopy(gen)  # snapshot before the prompt text
+            gen = self._prefill_text(gen, prompt)
+            cfg_img = self._prefill_text(cfg_img, prompt)
+        return gen, cfg_text, cfg_img
+
+    def _inject_it2i_contexts(self, req: OmniDiffusionRequest, image: PIL.Image.Image) -> None:
+        """Hand our three contexts to upstream through its injected-KV channel.
+
+        Upstream's ``forward`` skips ALL of its own prefill once
+        ``sampling_params.past_key_values`` is set, and reads the output canvas from
+        ``kv_metadata["image_shape"]``. Both are exactly what it2i needs, because
+        upstream's own img2img branch would otherwise:
+
+        1. override the canvas with the RESIZED SOURCE dims — the driver authored x_T
+           for the requested height/width, so the noise tap's shape check would fail;
+        2. preprocess the source with a stride-``latent_downsample`` resize plus a
+           fixed 980x980 ``SiglipImageProcessor`` squash instead of the vendored navit
+           transforms the trainer replays with (~4x the ViT token count, and the
+           aspect ratio dropped) — a conditioning mismatch no importance ratio can
+           correct, since rollout would earn its reward under one conditioning while
+           the gradient is taken under another.
+
+        ``ropes`` MUST ride the metadata: an image block advances ``kv_lens`` by
+        ``num_img_tokens + 2`` but rope by only ONE (the whole block shares a single
+        position), so upstream's ``ropes = [seq_len]`` fallback — harmless for
+        text-only t2i, where the two coincide — would be off by thousands here.
+
+        Repoints ``req`` at a SHALLOW COPY of its params: Omni shares one params
+        object across a generate call's requests, so writing this request's KV caches
+        into it in place would leak them into its siblings.
+        """
+        sp = req.sampling_params
+        if sp.height is None or sp.width is None:
+            raise ValueError(
+                "RLBagelPipeline it2i: sampling_params must carry height/width (the "
+                "output canvas the driver's x_T recipe was authored for)."
+            )
+        image_shape = (int(sp.height), int(sp.width))
+        gen, cfg_text, cfg_img = self._build_it2i_contexts(image, self._prompt_text(req))
+
+        sp = copy.copy(sp)
+        sp.past_key_values = gen["past_key_values"]
+        sp.kv_metadata = {"ropes": gen["ropes"], "image_shape": image_shape}
+        sp.cfg_text_past_key_values = cfg_text["past_key_values"]
+        sp.cfg_text_kv_metadata = {"ropes": cfg_text["ropes"]}
+        sp.cfg_img_past_key_values = cfg_img["past_key_values"]
+        sp.cfg_img_kv_metadata = {"ropes": cfg_img["ropes"]}
+        req.sampling_params = sp
+
+    # ------------------------------------------------------------------ #
     # arm — every request (stale-leak guards)
     # ------------------------------------------------------------------ #
 
@@ -325,6 +488,12 @@ class RLBagelPipeline(BagelPipeline):
                     f"is disabled."
                 )
             return self._forward_batched(req, spp, **kwargs)
+
+        # it2i: build the conditioning ourselves (trainside-identical) and inject it,
+        # so upstream's own img2img prefill never runs. No-op for t2i.
+        image = self._source_image(req)
+        if image is not None:
+            self._inject_it2i_contexts(req, image)
 
         self._arm_sde(req)
         self._arm_initial_noise(req)

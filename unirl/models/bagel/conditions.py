@@ -16,6 +16,12 @@ contexts, not a stacked tensor):
 - ``cfg_img_contexts[i]``  : image-CFG context
 - ``image_shapes[i]``      : (H, W) for sample i
 
+The vllm_omni path ships no contexts at all (they cannot cross the worker→driver
+IPC boundary) and instead carries the RAW conditioning material the stage rebuilds
+them from: ``prompts[i]`` and — for it2i (editing) — ``input_images[i]``, the raw
+source PIL. The stage feeds both through the same ``rl_ops`` prefill the rollout
+used, so the rebuilt contexts match.
+
 These are ``concat_field`` lists so :meth:`RolloutTrack.slice` / ``concat`` /
 ``select`` (which the train stack drives per micro-batch) re-index them per sample
 exactly like SD3's tensor conditions — the framework's list-field machinery
@@ -116,6 +122,11 @@ class BagelDiffusionConditions(Condition):
     cfg_text_contexts: List[Any] = concat_field(default_factory=list)
     cfg_img_contexts: List[Any] = concat_field(default_factory=list)
     prompts: List[Any] = concat_field(default_factory=list)
+    #: Deferred-rebuild source images (it2i only): the RAW per-sample PIL, exactly
+    #: as the rollout adapter shipped it to the worker. Empty on the t2i path and
+    #: on the opaque-context (trainside) path, where the image is already baked
+    #: into ``gen_contexts`` / ``cfg_text_contexts``.
+    input_images: List[Any] = concat_field(default_factory=list)
     image_shapes: List[Tuple[int, int]] = concat_field(default_factory=list)
 
     @property
@@ -187,12 +198,14 @@ class BagelDiffusionConditions(Condition):
         image_shape = tuple(self.image_shapes[0])
         return gen, cfg_text, cfg_img, image_shape
 
-    def single_prompt(self) -> Tuple[str, Tuple[int, int]]:
-        """Return ``(prompt, image_shape)`` for a 1-sample deferred-prompt batch.
+    def single_prompt(self) -> Tuple[str, Optional[Any], Tuple[int, int]]:
+        """Return ``(prompt, input_image, image_shape)`` for a 1-sample deferred batch.
 
         Used by the vllm_omni path: the stage rebuilds the three KV contexts from
-        this prompt on its own bundle. Raises if the batch isn't exactly one
-        sample or no prompt is present.
+        this material on its own bundle. ``input_image`` is the raw source PIL for
+        it2i and ``None`` for t2i, which is exactly the ``image`` argument the
+        rebuild (and ``BagelPipeline._build_contexts``) takes. Raises if the batch
+        isn't exactly one sample or no prompt is present.
         """
         require(
             self.batch_size == 1,
@@ -205,7 +218,8 @@ class BagelDiffusionConditions(Condition):
             "adapter must ship prompts for the deferred-rebuild path.",
         )
         image_shape = tuple(self.image_shapes[0])
-        return str(self.prompts[0]), image_shape
+        input_image = self.input_images[0] if self.input_images else None
+        return str(self.prompts[0]), input_image, image_shape
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "BagelDiffusionConditions":
