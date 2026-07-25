@@ -60,6 +60,7 @@ the documented local fixes. This subtree is excluded from repo lint/format.
 # API lacks ``flash_attn_varlen_func``. That function is the only symbol the vendored
 # navit code imports straight from the ``flash_attn`` package.
 import importlib
+import importlib.util
 import sys
 import types
 
@@ -67,6 +68,14 @@ try:
     _flash_attn = importlib.import_module("flash_attn")
 except Exception:
     _flash_attn = types.ModuleType("flash_attn")
+    # The stub MUST carry a real ModuleSpec. ``importlib.util.find_spec`` RAISES
+    # ``ValueError: flash_attn.__spec__ is None`` for a sys.modules entry whose
+    # ``__spec__`` is None (which is what a bare ``ModuleType`` has), so every later
+    # availability probe blows up instead of answering "absent" — transformers runs
+    # one at import time, so merely importing this package before transformers broke
+    # any downstream ``import transformers.<...>``. With a spec the probe proceeds and
+    # still concludes absent: no distribution metadata, no ``__file__``.
+    _flash_attn.__spec__ = importlib.util.spec_from_loader("flash_attn", loader=None)
     sys.modules["flash_attn"] = _flash_attn
 
 if not hasattr(_flash_attn, "flash_attn_varlen_func"):
