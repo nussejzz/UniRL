@@ -177,7 +177,12 @@ class BagelInputAdapter(DitInputAdapter):
             "cfg_renorm_type": str(getattr(diff_params, "cfg_renorm_type", "global")),
         }
         sde_indices = getattr(diff_params, "sde_indices", None)
-        if sde_indices is not None:
+        # eta == 0 (deterministic eval) means no step is stochastic. Shipping a
+        # non-empty gate anyway makes the worker scheduler raise ("step_index=N is in
+        # the SDE gate but eta=0.0"); an absent gate is its documented pure-Euler
+        # path, and matches trainside, whose ``diffuse`` gates per-step eta on the same
+        # params.eta and simply records no log-probs.
+        if sde_indices is not None and float(getattr(diff_params, "eta", 0.0)) > 0.0:
             extra_args["sde_indices"] = sorted({int(i) for i in sde_indices})
         # σ_max for the SDE std_dev_t clamp. The trainside BagelDiffusionStage uses
         # ``schedule[1]`` (the second σ point) as sigma_max — the value that
