@@ -63,11 +63,11 @@ class DiffusionTrainer(BaseTrainer):
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
-        # Colocate memory dance: offload the FSDP train state (params + grads +
-        # optimizer) to CPU during the rollout's generate so a colocate
-        # vLLM/SGLang engine fits, onload before the train backward. Off by
-        # default; only safe (and only set true) for layout=="colocate" with a
-        # SEPARATE engine rollout under GRPO — gated again in train_step.
+        # Colocate memory dance, opt-in:
+        # - separate vLLM/SGLang engine: offload FSDP during generate;
+        # - trainside engine: generate needs the FSDP model, so offload only
+        #   AFTER generate while a colocated external reward model is on GPU.
+        # Both paths onload before backward. Gated again in train_step/eval.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
         # FlowDPPO advantage parity: when True, RolloutTrack.compute_advantages
         # keeps the per-group mean but divides by ONE batch-wide std (the v1
@@ -416,6 +416,17 @@ class DiffusionTrainer(BaseTrainer):
             init_noise_latent_shape=init_noise_latent_shape,
         )
 
+    def _offload_for_reward_phase(self) -> bool:
+        """Whether reward may temporarily own the train GPU memory.
+
+        A trainside rollout needs the FSDP policy for generation, so it cannot
+        use the separate-engine generate-time offload.  After generation,
+        FlowGRPO reward scoring is model-independent and can safely borrow the
+        GPU until replay/backward.  DiffusionNFT is excluded because its EMA
+        adapter lifecycle touches the backend around rollout.
+        """
+        return self._enable_fsdp_offload and self._rollout_is_trainside and not self._uses_ema
+
     def train_step(
         self,
         req: RolloutReq,
@@ -475,9 +486,21 @@ class DiffusionTrainer(BaseTrainer):
         if _do_fsdp_offload:
             self.backend.onload()
 
-        for name, track in list(resp.tracks.items()):
-            if track.segment is not None:
-                resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
+        # Trainside rollout shares the train model and therefore cannot use the
+        # generate-time offload above.  Once generation is complete, however,
+        # reward scoring is model-independent: move params/grads/Adam to CPU so
+        # a single-node 7B EditReward scorer can temporarily occupy rank0, then
+        # restore the train state before advantage replay/backward.
+        _reward_phase_offload = self._offload_for_reward_phase()
+        if _reward_phase_offload:
+            self.backend.offload()
+        try:
+            for name, track in list(resp.tracks.items()):
+                if track.segment is not None:
+                    resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
+        finally:
+            if _reward_phase_offload:
+                self.backend.onload()
 
         mean_reward = 0.0
         for track in resp.tracks.values():
@@ -576,17 +599,53 @@ class DiffusionTrainer(BaseTrainer):
         counts = {name: 0 for name, _ in scorers}
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
-            req = self._build_req(sub, step, base_sampling=eval_sp)
+            # Evaluation must reuse the SAME driver-authored x_T at every
+            # checkpoint. ``_build_req`` includes its rollout_id in each noise key
+            # (``r{rollout_id}:{sample_id}``); passing ``step`` here made eval
+            # step 0/5/10/... start from different noise even with eval_eta=0, so
+            # reward movement mixed policy learning with x_T variance. Reserve
+            # 2^31-1 for eval (non-negative because WindowScheduler seeds NumPy):
+            # sample ids + base seed still give distinct, reproducible images,
+            # while every checkpoint sees identical initial latents.
+            req = self._build_req(sub, 2_147_483_647, base_sampling=eval_sp)
             resp = self.rollout.generate(req)
             track = next((t for t in resp.tracks.values() if t.segment is not None), None)
             if track is None:
                 continue
-            for name, reward in scorers:
-                scored = reward.score_and_attach(req=req, track=track)
-                if scored.rewards is not None:
-                    r = hydrate(scored.rewards).to(torch.float32)
-                    sums[name] += float(r.sum().item())
-                    counts[name] += int(r.numel())
+            _reward_phase_offload = self._offload_for_reward_phase()
+            if _reward_phase_offload:
+                self.backend.offload()
+            try:
+                for name, reward in scorers:
+                    scored = reward.score_and_attach(req=req, track=track)
+                    # Log one fixed-eval preview batch (source | edited) on the same
+                    # cadence as training media.  Unlike rollout media, these prompts
+                    # and x_T are stable across checkpoints, so visual changes are
+                    # attributable to the policy rather than a new random sample.
+                    wb = self.wandb_logger
+                    if (
+                        start == 0
+                        and name == "reward"
+                        and wb is not None
+                        and wb.should_log_media(step)
+                        and scored.decoded is not None
+                    ):
+                        from unirl.types.media_preview import build_media_preview_for_track
+
+                        preview = build_media_preview_for_track(
+                            req=req,
+                            track=scored,
+                            max_items=wb.media_max_items,
+                        )
+                        if preview is not None:
+                            wb.log_generated_media(step, preview, key="eval/generated_media")
+                    if scored.rewards is not None:
+                        r = hydrate(scored.rewards).to(torch.float32)
+                        sums[name] += float(r.sum().item())
+                        counts[name] += int(r.numel())
+            finally:
+                if _reward_phase_offload:
+                    self.backend.onload()
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def train(

@@ -1,0 +1,43 @@
+# Single-node, time-multiplexed EditReward service.
+#
+# Use when all physical GPUs are already reserved by a trainside policy job but
+# host RAM is plentiful.  The scorer actor consumes no Ray GPU resource, stays
+# on CPU between HTTP calls, and temporarily uses visible GPU0 while the trainer
+# offloads its FSDP state for the reward phase.
+#
+# Prerequisites:
+#   RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+#   CUDA_VISIBLE_DEVICES=0,1,...,N-1
+#   ray start --head --num-gpus=N
+#
+# Trainer override:
+#   +enable_fsdp_offload=true
+#
+# This changes placement/lifecycle only; reward values and training math are
+# identical to configs/editreward_service.yaml.
+
+cluster:
+  ray_address: auto
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  score_timeout_s: 300.0
+
+rewards:
+  - name: editreward
+    scorer: editreward
+    runtime_env: envs/editreward.txt
+    num_replicas: 1
+    # Keep all Ray GPU slots available to the policy workers.  The actor can
+    # still see GPU0 because RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0.
+    num_gpus: 0
+    num_cpus: 4
+    max_concurrency: 1
+    params:
+      checkpoint_path: TIGER-Lab/EditReward-MiMo-VL-7B-SFT-2508
+      config_path: config/EditReward-MiMo-VL-7B-SFT-2508.yaml
+      device: cuda
+      dtype: bfloat16
+      rm_head_type: ranknet_multi_head
+      offload_between_calls: true

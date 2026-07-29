@@ -13,15 +13,10 @@ The text prompt (editing instruction) is taken from history[0][0].
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
 from reward_service.scorers.base import BaseScorer, ScoreItem
 from reward_service.scorers.registry import register
-
-if TYPE_CHECKING:
-    from PIL import Image
 
 
 class EditRewardScorer(BaseScorer):
@@ -37,24 +32,28 @@ class EditRewardScorer(BaseScorer):
         device: str = "cuda",
         dtype: str = "bfloat16",
         rm_head_type: str = "ranknet_multi_head",
+        offload_between_calls: bool = False,
     ) -> None:
         import os
 
         from reward_service.scorers._editreward import EditRewardInferencer
 
-        self._device = device if torch.cuda.is_available() else "cpu"
+        self._target_device = device if torch.cuda.is_available() else "cpu"
+        self._offload_between_calls = bool(offload_between_calls and self._target_device != "cpu")
+        initial_device = "cpu" if self._offload_between_calls else self._target_device
         self._rm_head_type = rm_head_type
 
         # If checkpoint_path looks like a HF repo ID (not a local dir),
         # download it via huggingface_hub first.
         if not os.path.isdir(checkpoint_path) and "/" in checkpoint_path:
             from huggingface_hub import snapshot_download
+
             checkpoint_path = snapshot_download(repo_id=checkpoint_path)
 
         self.inferencer = EditRewardInferencer(
             config_path=config_path,
             checkpoint_path=checkpoint_path,
-            device=self._device,
+            device=initial_device,
             reward_dim="dim1",
             rm_head_type=rm_head_type,
         )
@@ -64,16 +63,31 @@ class EditRewardScorer(BaseScorer):
         if not items:
             return []
 
-        results: list[dict[str, float]] = []
+        try:
+            if self._offload_between_calls:
+                self._move_to(self._target_device)
+            results: list[dict[str, float]] = []
+            for item in items:
+                try:
+                    result = self._score_single(item)
+                except Exception:
+                    result = {k: float("nan") for k in self.sub_metric_names}
+                results.append(result)
+            return results
+        finally:
+            if self._offload_between_calls:
+                self._move_to("cpu")
+                torch.cuda.empty_cache()
 
-        for item in items:
-            try:
-                result = self._score_single(item)
-            except Exception:
-                result = {k: float("nan") for k in self.sub_metric_names}
-            results.append(result)
+    def _move_to(self, device: str) -> None:
+        """Move the 7B scorer as one unit and keep input placement in sync.
 
-        return results
+        Used only by the opt-in single-node deployment where all eight GPUs are
+        train ranks: the scorer stays on CPU during trainside generation's memory
+        peak, moves to GPU0 for the reward phase, then immediately returns to CPU.
+        """
+        self.inferencer.model.to(device)
+        self.inferencer.device = device
 
     def _score_single(self, item: ScoreItem) -> dict[str, float]:
         """Score a single item.
@@ -83,9 +97,7 @@ class EditRewardScorer(BaseScorer):
             history[1] = (prompt, edited_image)
         """
         if len(item.history) < 2:
-            raise ValueError(
-                f"EditReward requires 2 history turns (source + edited), got {len(item.history)}"
-            )
+            raise ValueError(f"EditReward requires 2 history turns (source + edited), got {len(item.history)}")
 
         prompt, source_image = item.history[0]
         _, edited_image = item.history[1]
