@@ -8,6 +8,7 @@ No handle is returned — the DTensors ARE the handle.  Ported from
 from __future__ import annotations
 
 import logging
+from functools import wraps
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -180,12 +181,14 @@ def fsdp_wrap(
         from torch.utils import checkpoint as _ckpt
 
         def _make_ckpt_forward(orig_fwd: object) -> object:
+            @wraps(orig_fwd)
             def wrapped(*args: object, **kwargs: object) -> object:
                 def fn(*a: object) -> object:
                     return orig_fwd(*a, **kwargs)
 
                 return _ckpt.checkpoint(fn, *args, use_reentrant=False)
 
+            wrapped._unirl_activation_checkpoint = True
             return wrapped
 
         for layer in block_instances:
