@@ -7,5 +7,6 @@ appropriate submodule directly:
 - ``unirl.reward.base`` — ``RewardBackend`` + ``BaseRewardComponentSpec``
 - ``unirl.reward.service`` — ``RewardService`` (holds one backend)
 - ``unirl.reward.remote`` — ``RemoteRewardBackend`` (remote backend)
+- ``unirl.reward.managed_process`` — rank-affine managed image scorer child
 - ``unirl.reward.local.<name>`` — per-scorer ``<Name>RewardScorer`` + ``<Name>Spec`` (local backends)
 """

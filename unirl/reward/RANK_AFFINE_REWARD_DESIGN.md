@@ -180,12 +180,14 @@ reward:
     config:
       _target_: unirl.reward.managed_process.ManagedScorerProcessSpec
       process:
+        _target_: unirl.reward.managed_process.ManagedProcessConfig
         python_executable: /venvs/reward/bin/python
         service_root: /workspace/unirl-reward-service
         startup_timeout: 1200
         shutdown_timeout: 30
         log_dir: /tmp/unirl-reward
       scorer:
+        _target_: unirl.reward.managed_process.ManagedScorerConfig
         name: editreward
         input_kind: image
         params:
@@ -195,11 +197,13 @@ reward:
           device: cuda
           dtype: bfloat16
       client:
+        _target_: unirl.reward.remote.RemoteRewardSpec
+        base_url: managed://rank-affine
         required_rewards: [editreward]
+        input_kind: image
         request_batch_size: 8
-        max_inflight: 1
         timeout: 600
-        retries: 1
+        max_retries: 1
         aggregation_method: weighted_sum
 ```
 
