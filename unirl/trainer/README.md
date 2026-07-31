@@ -264,8 +264,8 @@ an evaluation and checkpoint fall on the same step, evaluation runs first.
 - **FSDP offload during `generate` is off by default** and force-gated off for trainside
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **DP geometry has two batch dimensions.** Rollout/reward shard complete root
-  prompt trees, so `batch_size` must divide their DP sizes. The train stack shards
-  generated rows, so `batch_size * samples_per_prompt / train_dp_size` must divide
-  `num_updates_per_batch`.
+  prompt trees, so their DP sizes must divide `batch_size`. The train stack shards
+  generated rows, so `num_updates_per_batch` must divide
+  `batch_size * samples_per_prompt / train_dp_size`.
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).

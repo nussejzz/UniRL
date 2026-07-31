@@ -2,9 +2,10 @@ import dataclasses
 import inspect
 import logging
 import os
+import sys
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
@@ -21,6 +22,39 @@ from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
+
+
+def _run_cleanup_steps(
+    steps: List[Tuple[str, Callable[[], None]]],
+    *,
+    preserve_active_error: bool,
+) -> None:
+    """Run every cleanup step, preserving an active phase failure when present."""
+    first_error: Optional[Exception] = None
+    for name, cleanup in steps:
+        try:
+            cleanup()
+        except Exception as exc:
+            logger.exception("Diffusion lifecycle cleanup failed during %s", name)
+            if first_error is None:
+                first_error = exc
+    if first_error is not None and not preserve_active_error:
+        raise first_error
+
+
+def _validate_prompt_tree_dp_geometry(
+    *,
+    batch_size: int,
+    rollout_dp_size: int,
+    reward_dp_size: int,
+    context: str,
+) -> None:
+    for role, dp_size in (("rollout", rollout_dp_size), ("reward", reward_dp_size)):
+        if batch_size % dp_size:
+            raise ValueError(
+                f"{context}: {role} dp_size={dp_size} must divide batch_size={batch_size} "
+                "root prompt trees; DP_SCATTER preserves each prompt's whole subtree."
+            )
 
 
 def _validate_diffusion_dp_geometry(
@@ -51,12 +85,12 @@ def _validate_diffusion_dp_geometry(
     if invalid:
         raise ValueError(f"Diffusion DP geometry values must be positive; got {invalid}.")
 
-    for role, dp_size in (("rollout", rollout_dp_size), ("reward", reward_dp_size)):
-        if batch_size % dp_size:
-            raise ValueError(
-                f"batch_size={batch_size} root prompt trees must be divisible by "
-                f"{role} dp_size={dp_size}; DP_SCATTER preserves each prompt's whole subtree."
-            )
+    _validate_prompt_tree_dp_geometry(
+        batch_size=batch_size,
+        rollout_dp_size=rollout_dp_size,
+        reward_dp_size=reward_dp_size,
+        context="training",
+    )
 
     total_generated = batch_size * samples_per_prompt
     if total_generated % train_dp_size:
@@ -497,17 +531,21 @@ class DiffusionTrainer(BaseTrainer):
     def _reward_phase(self) -> Iterator[None]:
         """Temporarily offload trainside FSDP state while reward is active."""
         should_offload = self._offload_for_reward_phase()
-        if should_offload:
-            self.backend.offload()
+        offload_attempted = False
         try:
+            if should_offload:
+                offload_attempted = True
+                self.backend.offload()
             yield
         finally:
-            if should_offload:
-                self.backend.onload()
+            if offload_attempted:
+                _run_cleanup_steps(
+                    [("reward train onload", self.backend.onload)],
+                    preserve_active_error=sys.exc_info()[0] is not None,
+                )
 
     def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
         """Generate with exception-safe EMA, rollout, and FSDP lifecycle cleanup."""
-        self.rollout.wake_up()
         should_offload_train = (
             self._enable_fsdp_offload
             and self._layout != "separate"
@@ -515,29 +553,36 @@ class DiffusionTrainer(BaseTrainer):
             and not self._uses_ema
         )
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
-        train_offloaded = False
-        ema_applied = False
+        wake_attempted = False
+        train_offload_attempted = False
+        ema_apply_attempted = False
+        generation_succeeded = False
         try:
+            wake_attempted = True
+            self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
                 self.weight_sync.sync()
             if should_offload_train:
+                train_offload_attempted = True
                 self.backend.offload()
-                train_offloaded = True
             if should_swap_ema:
+                ema_apply_attempted = True
                 self.backend.apply_eval_ema()
-                ema_applied = True
-            return self.rollout.generate(sample)
+            result = self.rollout.generate(sample)
+            generation_succeeded = True
+            return result
         finally:
-            try:
-                if ema_applied:
-                    self.backend.restore_from_eval()
-            finally:
-                try:
-                    if self._rollout_sleep_after_generate:
-                        self.rollout.sleep()
-                finally:
-                    if train_offloaded:
-                        self.backend.onload()
+            cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
+            if ema_apply_attempted:
+                cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
+            if wake_attempted and (self._rollout_sleep_after_generate or not generation_succeeded):
+                cleanup_steps.append(("rollout sleep", self.rollout.sleep))
+            if train_offload_attempted:
+                cleanup_steps.append(("generate train onload", self.backend.onload))
+            _run_cleanup_steps(
+                cleanup_steps,
+                preserve_active_error=sys.exc_info()[0] is not None,
+            )
 
     def train_step(
         self,
@@ -672,6 +717,12 @@ class DiffusionTrainer(BaseTrainer):
         counts = {name: 0 for name, _ in scorers}
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
+            _validate_prompt_tree_dp_geometry(
+                batch_size=int(sub.batch_size),
+                rollout_dp_size=int(self.rollout.dp_size),
+                reward_dp_size=int(self.reward.dp_size),
+                context=f"evaluation chunk [{start}:{start + sub.batch_size}]",
+            )
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
             with self._reward_phase():

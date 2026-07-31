@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from unirl.trainer.diffusion import DiffusionTrainer, _validate_diffusion_dp_geometry
+from unirl.trainer.diffusion import (
+    DiffusionTrainer,
+    _validate_diffusion_dp_geometry,
+    _validate_prompt_tree_dp_geometry,
+)
 from unirl.types.sampling import DiffusionSamplingParams
 
 
@@ -105,6 +109,16 @@ def test_dp_geometry_validates_train_update_rows() -> None:
         )
 
 
+def test_eval_prompt_tree_geometry_rejects_ragged_tail() -> None:
+    with pytest.raises(ValueError, match="evaluation chunk"):
+        _validate_prompt_tree_dp_geometry(
+            batch_size=2,
+            rollout_dp_size=8,
+            reward_dp_size=8,
+            context="evaluation chunk [8:10]",
+        )
+
+
 def test_generate_default_sleep_and_offload_order() -> None:
     events: list[str] = []
     trainer = _trainer(events=events, enable_fsdp_offload=True)
@@ -142,6 +156,61 @@ def test_generate_failure_restores_rollout_and_train_state() -> None:
         "rollout.sleep",
         "train.onload",
     ]
+
+
+def test_partial_wake_failure_attempts_sleep_cleanup() -> None:
+    events: list[str] = []
+    trainer = _trainer(events=events)
+
+    def fail_wake() -> None:
+        events.append("rollout.wake")
+        raise RuntimeError("wake failed")
+
+    trainer.rollout.wake_up = fail_wake
+    with pytest.raises(RuntimeError, match="wake failed"):
+        trainer._generate_for_training(object(), sync_weights=False)
+    assert events == ["rollout.wake", "rollout.sleep"]
+
+
+def test_partial_offload_failure_attempts_onload_cleanup() -> None:
+    events: list[str] = []
+    trainer = _trainer(events=events, enable_fsdp_offload=True)
+
+    def fail_offload() -> None:
+        events.append("train.offload")
+        raise RuntimeError("offload failed")
+
+    trainer.backend.offload = fail_offload
+    with pytest.raises(RuntimeError, match="offload failed"):
+        trainer._generate_for_training(object(), sync_weights=False)
+    assert events == ["rollout.wake", "train.offload", "rollout.sleep", "train.onload"]
+
+
+def test_cleanup_failure_does_not_mask_generate_failure() -> None:
+    events: list[str] = []
+    trainer = _trainer(events=events, fail_generate=True)
+
+    def fail_sleep() -> None:
+        events.append("rollout.sleep")
+        raise RuntimeError("sleep failed")
+
+    trainer.rollout.sleep = fail_sleep
+    with pytest.raises(RuntimeError, match="generate failed"):
+        trainer._generate_for_training(object(), sync_weights=False)
+    assert events == ["rollout.wake", "rollout.generate", "rollout.sleep"]
+
+
+def test_cleanup_failure_surfaces_when_phase_succeeds() -> None:
+    events: list[str] = []
+    trainer = _trainer(events=events)
+
+    def fail_sleep() -> None:
+        events.append("rollout.sleep")
+        raise RuntimeError("sleep failed")
+
+    trainer.rollout.sleep = fail_sleep
+    with pytest.raises(RuntimeError, match="sleep failed"):
+        trainer._generate_for_training(object(), sync_weights=False)
 
 
 def test_trainside_ema_is_restored_after_generate() -> None:
