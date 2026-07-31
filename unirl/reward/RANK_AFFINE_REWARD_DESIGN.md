@@ -214,7 +214,7 @@ whole root-prompt trees. Consequently:
 
 - rollout and reward DP require the number of root prompts to be divisible by
   their DP size;
-- generated samples per optimizer update must separately divide the train DP;
+- train DP must separately divide the generated samples per optimizer update;
 - `batch_size * samples_per_prompt` is not sufficient to validate rollout/reward
   scatter;
 - a reward child must be attached to the reward worker that owns the shard, not

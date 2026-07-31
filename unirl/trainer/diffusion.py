@@ -668,8 +668,11 @@ class DiffusionTrainer(BaseTrainer):
             replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
         eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
-        self.rollout.wake_up()
+        wake_attempted = False
+        evaluation_succeeded = False
         try:
+            wake_attempted = True
+            self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
                 self.weight_sync.sync()
             # Default pass: training reward + shared-set suites score the SAME images.
@@ -681,9 +684,13 @@ class DiffusionTrainer(BaseTrainer):
                 if suite.data_source is not None:
                     n = suite.num_prompts or self.eval_num_prompts
                     metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+            evaluation_succeeded = True
         finally:
-            if sleep_after and self._rollout_sleep_after_generate:
-                self.rollout.sleep()
+            if wake_attempted and ((sleep_after and self._rollout_sleep_after_generate) or not evaluation_succeeded):
+                _run_cleanup_steps(
+                    [("evaluation rollout sleep", self.rollout.sleep)],
+                    preserve_active_error=sys.exc_info()[0] is not None,
+                )
         logger.info(
             "EVAL step %d  (%d samples/prompt, cfg=%.1f eta=%.1f)  %s",
             step,

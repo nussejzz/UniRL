@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from unirl.rollout.engine.vllm_omni.engine import VLLMOmniRolloutEngine
 from unirl.trainer.diffusion import (
     DiffusionTrainer,
     _validate_diffusion_dp_geometry,
@@ -211,6 +212,30 @@ def test_cleanup_failure_surfaces_when_phase_succeeds() -> None:
     trainer.rollout.sleep = fail_sleep
     with pytest.raises(RuntimeError, match="sleep failed"):
         trainer._generate_for_training(object(), sync_weights=False)
+
+
+def test_vllm_wake_rolls_back_physical_engine_after_lora_failure() -> None:
+    events: list[str] = []
+    engine = VLLMOmniRolloutEngine.__new__(VLLMOmniRolloutEngine)
+    engine._is_offloaded = True
+    engine._backend = SimpleNamespace(
+        wake_task=lambda: events.append("backend.wake"),
+        sleep_task=lambda: events.append("backend.sleep"),
+    )
+
+    def fail_restore() -> None:
+        events.append("lora.restore")
+        raise RuntimeError("restore failed")
+
+    engine._weight_sync = SimpleNamespace(
+        restore_lora_after_wake=fail_restore,
+        mark_weights_released=lambda: events.append("weights.released"),
+    )
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        VLLMOmniRolloutEngine.wake_up.__wrapped__(engine)
+    assert engine._is_offloaded is True
+    assert events == ["backend.wake", "lora.restore", "backend.sleep", "weights.released"]
 
 
 def test_trainside_ema_is_restored_after_generate() -> None:
