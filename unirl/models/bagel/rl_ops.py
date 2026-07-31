@@ -86,7 +86,6 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 __all__ = [
-    "activation_checkpoint_bypass_scope",
     "build_image_transforms",
     "clone_context",
     "decode_text",
@@ -105,30 +104,6 @@ __all__ = [
     "update_context_image",
     "update_context_text",
 ]
-
-
-@contextmanager
-def activation_checkpoint_bypass_scope(model: Any) -> Iterator[None]:
-    """Temporarily run checkpoint-wrapped blocks directly during KV prefill.
-
-    BAGEL prefill mutates its cache. A checkpoint closure would otherwise
-    recompute against the later cache contents during backward.
-    """
-    replaced = []
-    for module in model.language_model.modules():
-        forward = getattr(module, "forward", None)
-        if not getattr(forward, "_unirl_activation_checkpoint", False):
-            continue
-        raw = getattr(forward, "__wrapped__", None)
-        if raw is None:
-            raise RuntimeError("Activation-checkpoint wrapper exposes no original forward.")
-        replaced.append((module, forward))
-        module.forward = raw
-    try:
-        yield
-    finally:
-        for module, forward in replaced:
-            module.forward = forward
 
 
 def disable_inference_cache(model: Any) -> None:

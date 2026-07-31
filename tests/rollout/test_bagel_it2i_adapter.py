@@ -9,7 +9,6 @@ from unirl.models.bagel.conditions import BagelDiffusionConditions
 from unirl.models.bagel.diffusion import BagelDiffusionParams
 from unirl.models.bagel.rl_ops import (
     _encode_vae_posterior_mean,
-    activation_checkpoint_bypass_scope,
     update_context_image,
 )
 from unirl.rollout.engine.vllm_omni.adapters.bagel import BagelInputAdapter, BagelOutputAdapter
@@ -190,29 +189,6 @@ def test_differentiable_source_prefill_reaches_vae_path() -> None:
     updated["past_key_values"].key_cache[0].sum().backward()
     assert vae.weight.grad is not None
     assert vae.weight.grad.item() > 0
-
-
-def test_differentiable_prefill_bypasses_activation_checkpoint_wrapper() -> None:
-    class _Layer(torch.nn.Module):
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return x + 1
-
-    layer = _Layer()
-    original = layer.forward
-
-    def checkpointed(*args, **kwargs):
-        raise AssertionError("checkpoint wrapper must be bypassed")
-
-    checkpointed.__wrapped__ = original
-    checkpointed._unirl_activation_checkpoint = True
-    layer.forward = checkpointed
-    language_model = torch.nn.Module()
-    language_model.layer = layer
-    model = type("_Model", (), {"language_model": language_model})()
-
-    with activation_checkpoint_bypass_scope(model):
-        assert torch.equal(layer.forward(torch.tensor(1)), torch.tensor(2))
-    assert layer.forward is checkpointed
 
 
 def test_it2i_and_t2i_validate_opposite_image_contracts() -> None:

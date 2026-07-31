@@ -336,12 +336,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         # MoT in train() mode by then — under which the navit dispatch sends these
         # packed-inference prefills into ``forward_train``.
         grad_context = torch.enable_grad if differentiable else torch.no_grad
-        checkpoint_context = (
-            rl_ops.activation_checkpoint_bypass_scope(self.model.model) if differentiable else nullcontext()
-        )
         with (
             rl_ops.inference_dispatch_scope(self.model.model),
-            checkpoint_context,
             grad_context(),
             self._autocast_ctx(device),
         ):
