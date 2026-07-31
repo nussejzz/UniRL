@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from unirl.rollout.engine.vllm_omni.engine import VLLMOmniRolloutEngine
-from unirl.train.backend.fsdp.wrap import _clone_checkpoint_kwarg
+from unirl.train.backend.fsdp.wrap import _checkpoint_with_kwarg_snapshots, _clone_checkpoint_kwarg
 from unirl.trainer.diffusion import (
     DiffusionTrainer,
     _validate_diffusion_dp_geometry,
@@ -259,6 +259,39 @@ def test_checkpoint_kwarg_clone_snapshots_mutable_kv_cache() -> None:
     assert snapshot.key_cache[0].item() == 2.0
     snapshot.key_cache[0].sum().backward()
     assert source.grad is not None and source.grad.item() == 1.0
+
+
+def test_checkpoint_reenters_wrapped_module_with_original_cache_state() -> None:
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    class Cache:
+        def __init__(self, num_layers: int) -> None:
+            self.key_cache = {index: None for index in range(num_layers)}
+            self.value_cache = {index: None for index in range(num_layers)}
+
+        @property
+        def num_layers(self) -> int:
+            return len(self.key_cache)
+
+    seen_cache_values: list[torch.Tensor | None] = []
+
+    class Layer(torch.nn.Module):
+        def forward(self, value: torch.Tensor, *, cache: Cache) -> torch.Tensor:
+            seen_cache_values.append(cache.key_cache[0])
+            cache.key_cache[0] = value
+            return value.sin()
+
+    hook_calls: list[bool] = []
+    layer = Layer()
+    layer.register_forward_pre_hook(lambda *_: hook_calls.append(True))
+    wrapped = checkpoint_wrapper(layer, checkpoint_fn=_checkpoint_with_kwarg_snapshots)
+    cache = Cache(1)
+    value = torch.tensor([0.5], requires_grad=True)
+    wrapped(value, cache=cache).sum().backward()
+
+    assert seen_cache_values == [None, None]
+    assert len(hook_calls) == 2
+    assert cache.key_cache[0] is None
 
 
 def test_trainside_ema_is_restored_after_generate() -> None:

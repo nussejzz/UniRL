@@ -8,7 +8,7 @@ No handle is returned — the DTensors ARE the handle.  Ported from
 from __future__ import annotations
 
 import logging
-from functools import wraps
+from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -34,6 +34,19 @@ def _clone_checkpoint_kwarg(value: Any) -> Any:
         for index, tensor in value.value_cache.items()
     }
     return cloned
+
+
+def _checkpoint_with_kwarg_snapshots(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Checkpoint a module call while replaying mutable kwargs from snapshots."""
+    from torch.utils import checkpoint as torch_checkpoint
+
+    checkpoint_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in kwargs.items()}
+
+    def run(*inner_args: Any, **inner_kwargs: Any) -> Any:
+        call_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in inner_kwargs.items()}
+        return function(*inner_args, **call_kwargs)
+
+    return torch_checkpoint.checkpoint(run, *args, use_reentrant=False, **checkpoint_kwargs)
 
 
 def fsdp_wrap(
@@ -136,6 +149,24 @@ def fsdp_wrap(
             p.data = p.data.to(dst)
             casts += 1
 
+    if activation_checkpointing:
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            apply_activation_checkpointing,
+            checkpoint_wrapper,
+        )
+
+        block_ids = {id(layer) for layer in block_instances}
+        apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn=partial(
+                checkpoint_wrapper,
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                checkpoint_fn=_checkpoint_with_kwarg_snapshots,
+            ),
+            check_fn=lambda module: id(module) in block_ids,
+        )
+
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
 
@@ -192,25 +223,6 @@ def fsdp_wrap(
         fsdp_groups = [m for m in model.modules() if isinstance(m, FSDPModule)]
         for cur, nxt in zip(fsdp_groups, fsdp_groups[1:]):
             cur.set_modules_to_forward_prefetch([nxt])
-
-    if activation_checkpointing:
-        from torch.utils import checkpoint as _ckpt
-
-        def _make_ckpt_forward(orig_fwd: object) -> object:
-            @wraps(orig_fwd)
-            def wrapped(*args: object, **kwargs: object) -> object:
-                checkpoint_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in kwargs.items()}
-
-                def fn(*a: object) -> object:
-                    call_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in checkpoint_kwargs.items()}
-                    return orig_fwd(*a, **call_kwargs)
-
-                return _ckpt.checkpoint(fn, *args, use_reentrant=False)
-
-            return wrapped
-
-        for layer in block_instances:
-            layer.forward = _make_ckpt_forward(layer.forward)
 
     if use_torch_compile:
         for layer in block_instances:
