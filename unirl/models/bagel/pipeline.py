@@ -47,7 +47,6 @@ import logging
 from collections import OrderedDict
 from contextlib import nullcontext
 from copy import deepcopy
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -62,10 +61,10 @@ from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.types.segments.latent import LatentSegment
 from unirl.types.segments.text import TextSegment
 
+from . import rl_ops
 from .ar import BagelARStage
 from .conditions import BagelARConditions, BagelDiffusionConditions
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage
-from .rl_ops import _to_device
 from .vae import BagelVAEDecodeStage, BagelVAEEncodeStage, bagel_latent_shape
 
 if TYPE_CHECKING:
@@ -192,14 +191,6 @@ class BagelPipeline(Pipeline):
             return torch.autocast("cuda", dtype)
         return nullcontext()
 
-    def _resize_input_image(self, image: Any) -> Any:
-        """Canonical input-image preproc (inferencer.py:249): rgb → aspect-preserving
-        stride-8 resize. Every image-input task funnels through this before the
-        VAE/ViT branches so the chain has one home."""
-        from .vendor.data.data_utils import pil_img2rgb
-
-        return self.bundle.vae_transform.resize_transform(pil_img2rgb(image))
-
     def _extract_input_images(self, conditioning: List[Any], task: str, *, n_prompts: Optional[int]) -> List[Any]:
         """Validated per-sample input PILs for image-input tasks (it2i / i2t / it2t).
 
@@ -224,51 +215,6 @@ class BagelPipeline(Pipeline):
             )
         return pil_images
 
-    def _update_context_image(self, image: Any, gen_context: Any, *, vae: bool, vit: bool) -> Any:
-        """Prefill one input image into a KV context (VAE and/or ViT branch).
-
-        Mirrors the vendored ``InterleaveInferencer.update_context_image``
-        (vendor/inferencer.py:62-96) with explicit device pinning: the vendored
-        ``prepare_vae_images`` / ``prepare_vit_images`` build their tensors on
-        CPU and the bundle's VAE carries no accelerate hooks, so ``padded_images``
-        (and the packed index tensors) must be moved before the cache update.
-        ``image`` is already ``resize_transform``-ed. Caller owns no_grad+autocast.
-        """
-        bagel = self.bundle.model
-        device = torch.device(self.bundle.device)
-        ctx = gen_context
-        if vae:
-            gi, kv_lens, ropes = bagel.prepare_vae_images(
-                curr_kvlens=ctx["kv_lens"],
-                curr_rope=ctx["ropes"],
-                images=[image],
-                transforms=self.bundle.vae_transform,
-                new_token_ids=self.bundle.new_token_ids,
-            )
-            gi = _to_device(gi, device)
-            # Sticky-fp32 VAE after decode; vendor only calls .encode then vae2llm.
-            vae_mod, proj = self.bundle.vae, bagel.vae2llm
-
-            def _vae_encode(x: torch.Tensor) -> torch.Tensor:
-                return vae_mod.encode(x.to(dtype=next(vae_mod.parameters()).dtype)).to(
-                    dtype=next(proj.parameters()).dtype
-                )
-
-            past = bagel.forward_cache_update_vae(SimpleNamespace(encode=_vae_encode), ctx["past_key_values"], **gi)
-            ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
-        if vit:
-            gi, kv_lens, ropes = bagel.prepare_vit_images(
-                curr_kvlens=ctx["kv_lens"],
-                curr_rope=ctx["ropes"],
-                images=[image],
-                transforms=self.bundle.vit_transform,
-                new_token_ids=self.bundle.new_token_ids,
-            )
-            gi = _to_device(gi, device)
-            past = bagel.forward_cache_update_vit(ctx["past_key_values"], **gi)
-            ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
-        return ctx
-
     def _build_contexts(self, prompt: str, image: Optional[Any] = None) -> Tuple[Any, Any, Any]:
         """Build (gen, cfg_text, cfg_img) KV contexts for T2I or editing (it2i).
 
@@ -290,7 +236,8 @@ class BagelPipeline(Pipeline):
         cfg_img = deepcopy(gen)
         with torch.no_grad(), self._autocast_ctx():
             if image is not None:
-                gen = self._update_context_image(self._resize_input_image(image), gen, vae=True, vit=True)
+                resized = rl_ops.resize_input_image(self.bundle, image)
+                gen = rl_ops.update_context_image(self.bundle, resized, gen, vae=True, vit=True)
             cfg_text = deepcopy(gen)  # snapshot before the prompt text → drop-text branch
             gen = inf.update_context_text(prompt, gen)
             cfg_img = inf.update_context_text(prompt, cfg_img)
@@ -487,6 +434,7 @@ class BagelPipeline(Pipeline):
             params=params,
             sample=sample,
             image_shape=image_shape,
+            input_images=pil_images,
         )
 
         filled = frontier.fill(segment=segment, primitives={"image": images}, conditions=conditions.to_dict())
@@ -500,6 +448,7 @@ class BagelPipeline(Pipeline):
         params: BagelDiffusionParams,
         sample: Sample,
         image_shape: Tuple[int, int],
+        input_images: Optional[List[Any]] = None,
     ) -> Tuple[LatentSegment, BagelDiffusionConditions, Images]:
         """Diffuse per-sample over prebuilt ``(gen, cfg_text, cfg_img)`` contexts,
         batch the latents, build the ``BagelDiffusionConditions``, and VAE-decode.
@@ -507,9 +456,10 @@ class BagelPipeline(Pipeline):
         Shared by image-out (t2i / it2i) and think-then-generate (t2ti). x_T is
         driver-authored per-sample via :class:`NoiseRecipe` (keyed on the gen Part's
         sample ids — engine draws its own when no driver recipe is present); the
-        three CFG contexts ride verbatim into the stored conditions for
-        frozen-context replay. σ is read off the diffusion gen Part's pinned
-        ``DiffusionSamplingParams.sigmas``.
+        three CFG contexts ride into the stored conditions. T2I replay reuses
+        them; it2i also stores the raw source image so grad-enabled replay can
+        rebuild the trainable GEN prefill. σ is read off the diffusion gen
+        Part's pinned ``DiffusionSamplingParams.sigmas``.
         """
         device = torch.device(self.bundle.device)
         schedule = params.sigmas.to(device)
@@ -542,6 +492,7 @@ class BagelPipeline(Pipeline):
             cfg_text_contexts=cfg_text_list,
             cfg_img_contexts=cfg_img_list,
             prompts=list(prompts),
+            input_images=list(input_images) if input_images is not None else [],
             image_shapes=shapes,
         )
         images = self.vae_decode.decode(segment, image_shape=image_shape)
@@ -619,7 +570,7 @@ class BagelPipeline(Pipeline):
                 # Understanding preproc chain (inferencer.py:249-250, vae=False):
                 # rgb → vae resize → vit_transform; store the FINAL pixels so
                 # rollout and replay consume byte-identical inputs.
-                img = self._resize_input_image(pil_images[i])
+                img = rl_ops.resize_input_image(self.bundle, pil_images[i])
                 splits.append({"kind": "vit", "image": self.bundle.vit_transform(img)})
             if prompts is not None:
                 # bos/eos (<|im_start|>/<|im_end|>) wrap, as prepare_prompts does
