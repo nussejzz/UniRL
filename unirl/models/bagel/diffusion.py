@@ -8,8 +8,7 @@ contexts (gen / cfg_text / cfg_img) and returns the CFG-combined velocity ``v_t`
 This stage reads **exactly like** :class:`unirl.models.sd3.diffusion.SD3DiffusionStage`
 — it rides UniRL's shared diffusion runtime and only swaps in Bagel's velocity call:
 
-- **σ / timestep schedule** comes from ``req.sigmas`` (pinned by the engine via
-  :func:`unirl.sde.runtime.ensure_req_sigmas` from the pipeline's
+- **σ / timestep schedule** comes from ``params.sigmas`` (pinned by the engine from the pipeline's
   ``build_schedule_policy``), passed in as ``schedule`` — NOT computed here.
 - **which steps run SDE** comes from ``params.sde_indices`` (the driver resolved it
   via :meth:`DiffusionSamplingParams.resolve_sde_indices` → the recipe's indices
@@ -39,6 +38,7 @@ bundle instance at call time — so ``BagelDiffusionParams`` stays CPU-importabl
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
@@ -72,14 +72,14 @@ class BagelDiffusionParams(DiffusionSamplingParams):
     ``init_same_noise`` / ``scheduler`` / ``sde_indices``), while
     :class:`BagelDiffusionStage` reads the Bagel-specific CFG knobs added here.
 
-    Bagel runs **one prompt at a time** (``bs=1`` packed): ``samples_per_prompt``
-    fan-out is materialized by the trainer (``RolloutInputs.expand``) into separate
-    samples, not batched inside one ``_forward_flow``.
+    Each Bagel ``_forward_flow`` row remains a packed ``bs=1`` sequence. The
+    Sample lineage materializes every generated row, while capable rollout
+    engines group prompts and use native ``num_outputs_per_prompt`` fan-out.
 
     The SDE machinery is now **all inherited / central**: ``eta`` is the SDE noise
     scale (flow_grpo's ``noise_level``); ``scheduler`` (the recipe's
     :class:`~unirl.utils.scheduler_utils.AllSDEScheduler`) picks the SDE steps via
-    :meth:`resolve_sde_indices`; the σ schedule rides on ``req.sigmas``. No
+    :meth:`resolve_sde_indices`; the σ schedule rides on ``params.sigmas``. No
     Bagel-specific window / schedule fields remain.
     """
 
@@ -245,15 +245,15 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     Owns the bundle, the per-step navit kernel, the SDE ``strategy``, and the
     precision policy. ``diffuse`` runs the full sampling loop over the engine-pinned
-    ``schedule`` (``req.sigmas``), recording SDE log-probs at ``params.sde_indices``;
+    ``schedule`` (``params.sigmas``), recording SDE log-probs at ``params.sde_indices``;
     ``replay`` recomputes those log-probs for GRPO. Reuses
     ``unirl.algorithms.flowgrpo.FlowGRPO`` unchanged.
 
     Implements the ``DiffusionStage`` protocol (``diffuse`` / ``replay`` /
     ``predict_noise_at_step``) so the trainside engine's ``isinstance(stage,
     DiffusionStage)`` check passes → it builds the σ-schedule policy from
-    :meth:`BagelPipeline.build_schedule_policy` and pins ``req.sigmas`` via
-    ``ensure_req_sigmas`` before ``generate`` (same path as SD3 / Wan / Qwen-Image).
+    :meth:`BagelPipeline.build_schedule_policy` and pins ``params.sigmas`` via
+    ``ensure_sample_sigmas`` before ``generate`` (same path as SD3 / Wan / Qwen-Image).
     """
 
     def __init__(
@@ -309,8 +309,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         ``ImageTransform`` pair used here, so a worker that runs it would condition
         rollout on different pixels than replay.
         """
-        from copy import deepcopy
-
         if image is not None and getattr(self.model.model, "vit_model", None) is None:
             raise ValueError(
                 "BagelDiffusionStage: the conditions carry an it2i source image but the bundle "
@@ -331,7 +329,11 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         # Force eval: this rebuild runs inside ``replay``, and the train stack has the
         # MoT in train() mode by then — under which the navit dispatch sends these
         # packed-inference prefills into ``forward_train``.
-        with rl_ops.inference_dispatch_scope(self.model.model), torch.no_grad(), self._autocast_ctx(device):
+        with (
+            rl_ops.inference_dispatch_scope(self.model.model),
+            torch.no_grad(),
+            self._autocast_ctx(device),
+        ):
             if image is not None:
                 resized = rl_ops.resize_input_image(self.model, image)
                 gen = rl_ops.update_context_image(self.model, resized, gen, vae=True, vit=True)

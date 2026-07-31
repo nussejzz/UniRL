@@ -40,7 +40,7 @@
 #   --config-name diffusion/bagel/bagel_it2i_vllmomni --cfg job --resolve
 # Smoke first — it2i colocate is the tightest memory shape in the family (7B MoT +
 # ViT on the trainer AND a full BAGEL in each worker, plus source-image KV):
-#   override batch_size=2 num_rollouts=2 eval_interval=2 sampling.samples_per_prompt=2
+#   override batch_size=8 num_rollouts=2 eval_interval=2 sampling.samples_per_prompt=2
 
 num_devices: 8
 batch_size: 8                  # prompts/rollout (x samples_per_prompt = images/rollout)
@@ -68,9 +68,9 @@ weight_sync_interval: 1
 # phases; set false only after a measured resident Train+Rollout+Reward budget fits.
 rollout_sleep_after_generate: true
 
-# NB: no `stage_config.task: it2i` here. On the trainside recipe that pin is what
+# NB: no `task_config.task: it2i` here. On the trainside recipe that pin is what
 # makes a source-image-less dataset fail loudly; on this path the modality does it —
-# BagelIt2iAdapter.validate_request rejects a request without primitives['image'].
+# BagelIt2iAdapter.validate_request rejects a Sample without image conditioning.
 
 logging:
   report_to_wandb: true

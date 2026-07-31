@@ -5,10 +5,9 @@
 # separate AR/Thinker prelude — think mode is off for the GRPO path).
 #
 # Shared by BOTH image-out modalities — ``bagel_t2i`` and ``bagel_it2i``
-# (editing). That one worker already owns the ViT and the img2img prefill, and
-# the source image travels on the request (``multi_modal_data["image"]``), not in
-# this config, so the two modalities need no stage-level difference. Keep it that
-# way: a second near-identical YAML would just be one more file to keep in sync.
+# (editing). The custom worker pipeline owns the ViT and editing prefill; the
+# source image travels on the request (``multi_modal_data["image"]``), not in this
+# config, so the two modalities need no stage-level difference.
 #
 # Diff vs upstream's bagel_single_stage deploy yaml:
 #   - custom_pipeline_args installs our RLBagelPipeline subclass. Unlike SD3/Qwen
@@ -31,7 +30,7 @@
 #     linspace(1, 0, num_timesteps) and loops num_timesteps-1 steps. BAGEL builds
 #     its sigma schedule internally (it ignores sampling_params.sigmas), with a
 #     hardwired timestep_shift=3.0 == the trainside shift, so the worker schedule
-#     equals the engine-pinned req.sigmas; the response sigma-echo verify asserts it.
+#     equals the diffusion Part's pinned sigmas; response sigma-echo verification asserts it.
 #   - trust_remote_code: BAGEL ships custom configs (llm_config.json / vit_config.json).
 #
 # NB: no ``pipeline:`` key — the legacy stage_configs loader reads only
@@ -68,7 +67,7 @@ stage_args:
       # Without ``enable_lora``, ``add_lora`` still registers the adapter (so
       # checksum probes pass) but no Linear consults it and the forward silently
       # runs base weights. ``max_lora_rank`` must be >= the recipe's LoRA rank
-      # (64 in bagel_trainside_lora); vllm's default of 16 silently rejects larger.
+      # (64 in the BAGEL LoRA recipes); vLLM's default of 16 rejects larger ranks.
       enable_lora: true
       max_lora_rank: 64
       parallel_config:

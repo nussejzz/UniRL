@@ -76,6 +76,7 @@ function serves rollout, the ratio test, and training.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -235,7 +236,7 @@ def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
 
 
 @contextmanager
-def inference_dispatch_scope(model: Any):
+def inference_dispatch_scope(model: Any) -> Iterator[None]:
     """Force the MoT into ``eval()`` for the duration of a packed-INFERENCE call.
 
     Every navit module routes ``forward_train`` vs ``forward_inference`` on
@@ -325,9 +326,11 @@ def update_context_image(bundle: Any, image: Any, ctx: Dict[str, Any], *, vae: b
         gi = _to_device(gi, device)
         # Sticky-fp32 VAE after decode; vendor only calls .encode then vae2llm.
         vae_mod, proj = bundle.vae, bagel.vae2llm
+        vae_dtype = next(vae_mod.parameters()).dtype
+        projection_dtype = next(proj.parameters()).dtype
 
         def _vae_encode(x: torch.Tensor) -> torch.Tensor:
-            return vae_mod.encode(x.to(dtype=next(vae_mod.parameters()).dtype)).to(dtype=next(proj.parameters()).dtype)
+            return vae_mod.encode(x.to(dtype=vae_dtype)).to(dtype=projection_dtype)
 
         past = bagel.forward_cache_update_vae(SimpleNamespace(encode=_vae_encode), ctx["past_key_values"], **gi)
         ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}

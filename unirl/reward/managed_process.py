@@ -18,7 +18,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import BinaryIO
 
 import requests
 
@@ -38,17 +38,18 @@ class ManagedRewardProcessSpec(BaseRewardComponentSpec):
     service_root: str = ""
     checkpoint_path: str = ""
     model_name_or_path: str = ""
-    config_path: Optional[str] = None
+    config_path: str | None = None
     scorer_name: str = "editreward"
     device: str = "cuda"
     dtype: str = "bfloat16"
     rm_head_type: str = "ranknet_multi_head"
+    offload_between_calls: bool = False
     startup_timeout: float = 1200.0
     shutdown_timeout: float = 30.0
     log_dir: str = "/tmp"
 
-    required_rewards: Tuple[str, ...] = ("editreward",)
-    reward_weights: Optional[Dict[str, float]] = None
+    required_rewards: tuple[str, ...] = ("editreward",)
+    reward_weights: dict[str, float] | None = None
     batch_size: int = 8
     timeout: float = 600.0
     max_retries: int = 1
@@ -66,6 +67,9 @@ class ManagedRewardProcessSpec(BaseRewardComponentSpec):
         require(Path(self.model_name_or_path).is_dir(), f"reward base model not found: {self.model_name_or_path}")
         require(self.startup_timeout > 0, "startup_timeout must be positive")
         require(self.shutdown_timeout > 0, "shutdown_timeout must be positive")
+        require(self.batch_size > 0, "batch_size must be positive")
+        require(self.timeout > 0, "timeout must be positive")
+        require(self.scorer_name == "editreward", "managed reward process currently supports only editreward")
         require(tuple(self.required_rewards) == (self.scorer_name,), "managed process serves exactly scorer_name")
 
 
@@ -74,83 +78,84 @@ class ManagedRewardProcessBackend(RemoteRewardBackend):
 
     def __init__(self, *, config: ManagedRewardProcessSpec, base_device: str) -> None:
         self.process_config = config
-        self._process: Optional[subprocess.Popen] = None
-        self._process_log = None
+        self._process: subprocess.Popen[bytes] | None = None
+        self._process_log: BinaryIO | None = None
         self._disposed = False
+        self._atexit_registered = False
         try:
             base_url = self._start_child()
+            remote_spec = RemoteRewardSpec(
+                base_url=base_url,
+                required_rewards=tuple(config.required_rewards),
+                reward_weights=dict(config.reward_weights or {}),
+                batch_size=int(config.batch_size),
+                timeout=float(config.timeout),
+                max_retries=int(config.max_retries),
+                retry_delay=float(config.retry_delay),
+                sub_metric_reduce=str(config.sub_metric_reduce),
+                aggregation_method=str(config.aggregation_method),
+                image_format=str(config.image_format),
+                image_quality=int(config.image_quality),
+                input_kind="image",
+                raise_on_failure=bool(config.raise_on_failure),
+            )
+            super().__init__(config=remote_spec, base_device=base_device)
         except Exception:
             self._stop_child()
             raise
-        remote_spec = RemoteRewardSpec(
-            base_url=base_url,
-            required_rewards=tuple(config.required_rewards),
-            reward_weights=dict(config.reward_weights or {}),
-            batch_size=int(config.batch_size),
-            timeout=float(config.timeout),
-            max_retries=int(config.max_retries),
-            retry_delay=float(config.retry_delay),
-            sub_metric_reduce=str(config.sub_metric_reduce),
-            aggregation_method=str(config.aggregation_method),
-            image_format=str(config.image_format),
-            image_quality=int(config.image_quality),
-            input_kind="image",
-            raise_on_failure=bool(config.raise_on_failure),
-        )
-        super().__init__(config=remote_spec, base_device=base_device)
         atexit.register(self._stop_child)
+        self._atexit_registered = True
 
     def _start_child(self) -> str:
         cfg = self.process_config
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(128)
-        listener.set_inheritable(True)
-        port = int(listener.getsockname()[1])
-
-        log_dir = Path(cfg.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"editreward-child-{os.getpid()}-{port}.log"
-        self._process_log = log_path.open("ab", buffering=0)
-
-        params = {
-            "checkpoint_path": cfg.checkpoint_path,
-            "config_path": cfg.config_path,
-            "model_name_or_path": cfg.model_name_or_path,
-            "device": cfg.device,
-            "dtype": cfg.dtype,
-            "rm_head_type": cfg.rm_head_type,
-            "offload_between_calls": False,
-        }
-        command = [
-            cfg.python_executable,
-            "-m",
-            "reward_service.direct_server",
-            "--fd",
-            str(listener.fileno()),
-            "--scorer",
-            cfg.scorer_name,
-            "--params-json",
-            json.dumps(params, separators=(",", ":")),
-        ]
         env = dict(os.environ)
         existing_pythonpath = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = cfg.service_root + (f":{existing_pythonpath}" if existing_pythonpath else "")
+        env["PYTHONPATH"] = cfg.service_root + (f"{os.pathsep}{existing_pythonpath}" if existing_pythonpath else "")
         env["TOKENIZERS_PARALLELISM"] = "false"
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         env.pop("RAY_ADDRESS", None)
         env["UNIRL_REWARD_PARENT_PID"] = str(os.getpid())
 
-        logger.info(
-            "starting rank-affine reward child port=%d cuda_visible=%s python=%s log=%s",
-            port,
-            env.get("CUDA_VISIBLE_DEVICES", "<unset>"),
-            cfg.python_executable,
-            log_path,
-        )
-        try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(128)
+            listener.set_inheritable(True)
+            port = int(listener.getsockname()[1])
+
+            log_dir = Path(cfg.log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{cfg.scorer_name}-child-{os.getpid()}-{port}.log"
+            self._process_log = log_path.open("ab", buffering=0)
+
+            params = {
+                "checkpoint_path": cfg.checkpoint_path,
+                "config_path": cfg.config_path,
+                "model_name_or_path": cfg.model_name_or_path,
+                "device": cfg.device,
+                "dtype": cfg.dtype,
+                "rm_head_type": cfg.rm_head_type,
+                "offload_between_calls": cfg.offload_between_calls,
+            }
+            command = [
+                cfg.python_executable,
+                "-m",
+                "reward_service.direct_server",
+                "--fd",
+                str(listener.fileno()),
+                "--scorer",
+                cfg.scorer_name,
+                "--params-json",
+                json.dumps(params, separators=(",", ":")),
+            ]
+            logger.info(
+                "starting rank-affine reward child port=%d cuda_visible=%s python=%s log=%s",
+                port,
+                env.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+                cfg.python_executable,
+                log_path,
+            )
             self._process = subprocess.Popen(
                 command,
                 env=env,
@@ -160,8 +165,6 @@ class ManagedRewardProcessBackend(RemoteRewardBackend):
                 start_new_session=True,
                 close_fds=True,
             )
-        finally:
-            listener.close()
 
         base_url = f"http://127.0.0.1:{port}"
         session = requests.Session()
@@ -194,17 +197,22 @@ class ManagedRewardProcessBackend(RemoteRewardBackend):
         return super().is_available()
 
     def offload(self) -> None:
-        """Resident mode: keep the reward model on its assigned GPU."""
+        """No-op: the child scorer owns its configured per-call lifecycle."""
 
     def onload(self) -> None:
-        """Resident mode: the reward model is already on its assigned GPU."""
+        """No-op: the child scorer owns its configured per-call lifecycle."""
 
     def dispose(self) -> None:
         if self._disposed:
             return
         self._disposed = True
-        super().dispose()
-        self._stop_child()
+        if self._atexit_registered:
+            atexit.unregister(self._stop_child)
+            self._atexit_registered = False
+        try:
+            super().dispose()
+        finally:
+            self._stop_child()
 
     def _stop_child(self) -> None:
         process = self._process
