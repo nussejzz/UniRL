@@ -316,16 +316,11 @@ def _encode_vae_posterior_mean(vae: Any, x: torch.Tensor) -> torch.Tensor:
 
 
 def clone_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """Clone a BAGEL KV context while preserving tensor autograd edges."""
+    """Copy a BAGEL KV context for copy-on-write cache updates."""
     cache = ctx["past_key_values"]
     cloned_cache = type(cache)(cache.num_layers)
-    cloned_cache.key_cache = {
-        index: (value.clone() if isinstance(value, torch.Tensor) else value) for index, value in cache.key_cache.items()
-    }
-    cloned_cache.value_cache = {
-        index: (value.clone() if isinstance(value, torch.Tensor) else value)
-        for index, value in cache.value_cache.items()
-    }
+    cloned_cache.key_cache = dict(cache.key_cache)
+    cloned_cache.value_cache = dict(cache.value_cache)
     return {
         "kv_lens": list(ctx["kv_lens"]),
         "ropes": list(ctx["ropes"]),

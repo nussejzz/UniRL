@@ -9,6 +9,7 @@ from unirl.models.bagel.conditions import BagelDiffusionConditions
 from unirl.models.bagel.diffusion import BagelDiffusionParams
 from unirl.models.bagel.rl_ops import (
     _encode_vae_posterior_mean,
+    clone_context,
     update_context_image,
 )
 from unirl.rollout.engine.vllm_omni.adapters.bagel import BagelInputAdapter, BagelOutputAdapter
@@ -189,6 +190,29 @@ def test_differentiable_source_prefill_reaches_vae_path() -> None:
     updated["past_key_values"].key_cache[0].sum().backward()
     assert vae.weight.grad is not None
     assert vae.weight.grad.item() > 0
+
+
+def test_context_clone_shares_tensor_storage_but_isolates_cache_mapping() -> None:
+    class Cache:
+        def __init__(self, num_layers: int) -> None:
+            self.key_cache = {index: None for index in range(num_layers)}
+            self.value_cache = {index: None for index in range(num_layers)}
+
+        @property
+        def num_layers(self) -> int:
+            return len(self.key_cache)
+
+    value = torch.tensor([1.0], requires_grad=True)
+    cache = Cache(1)
+    cache.key_cache[0] = value
+    context = {"kv_lens": [1], "ropes": [0], "past_key_values": cache}
+
+    cloned = clone_context(context)
+    assert cloned["past_key_values"].key_cache[0] is value
+    cloned["past_key_values"].key_cache[0] = torch.tensor([2.0])
+
+    assert context["past_key_values"].key_cache[0] is value
+    assert cloned["past_key_values"].value_cache is not cache.value_cache
 
 
 def test_it2i_and_t2i_validate_opposite_image_contracts() -> None:
