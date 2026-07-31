@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from functools import wraps
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -18,6 +18,22 @@ from unirl.config.require import require
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
+
+
+def _clone_checkpoint_kwarg(value: Any) -> Any:
+    """Snapshot mutable KV-cache kwargs for deterministic checkpoint replay."""
+    if not (hasattr(value, "key_cache") and hasattr(value, "value_cache")):
+        return value
+    cloned = type(value)(value.num_layers)
+    cloned.key_cache = {
+        index: (tensor.clone() if isinstance(tensor, torch.Tensor) else tensor)
+        for index, tensor in value.key_cache.items()
+    }
+    cloned.value_cache = {
+        index: (tensor.clone() if isinstance(tensor, torch.Tensor) else tensor)
+        for index, tensor in value.value_cache.items()
+    }
+    return cloned
 
 
 def fsdp_wrap(
@@ -183,12 +199,14 @@ def fsdp_wrap(
         def _make_ckpt_forward(orig_fwd: object) -> object:
             @wraps(orig_fwd)
             def wrapped(*args: object, **kwargs: object) -> object:
+                checkpoint_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in kwargs.items()}
+
                 def fn(*a: object) -> object:
-                    return orig_fwd(*a, **kwargs)
+                    call_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in checkpoint_kwargs.items()}
+                    return orig_fwd(*a, **call_kwargs)
 
                 return _ckpt.checkpoint(fn, *args, use_reentrant=False)
 
-            wrapped._unirl_activation_checkpoint = True
             return wrapped
 
         for layer in block_instances:

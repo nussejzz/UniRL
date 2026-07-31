@@ -3,8 +3,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from unirl.rollout.engine.vllm_omni.engine import VLLMOmniRolloutEngine
+from unirl.train.backend.fsdp.wrap import _clone_checkpoint_kwarg
 from unirl.trainer.diffusion import (
     DiffusionTrainer,
     _validate_diffusion_dp_geometry,
@@ -236,6 +238,27 @@ def test_vllm_wake_rolls_back_physical_engine_after_lora_failure() -> None:
         VLLMOmniRolloutEngine.wake_up.__wrapped__(engine)
     assert engine._is_offloaded is True
     assert events == ["backend.wake", "lora.restore", "backend.sleep", "weights.released"]
+
+
+def test_checkpoint_kwarg_clone_snapshots_mutable_kv_cache() -> None:
+    class Cache:
+        def __init__(self, num_layers: int) -> None:
+            self.key_cache = {index: None for index in range(num_layers)}
+            self.value_cache = {index: None for index in range(num_layers)}
+
+        @property
+        def num_layers(self) -> int:
+            return len(self.key_cache)
+
+    source = torch.tensor([2.0], requires_grad=True)
+    cache = Cache(1)
+    cache.key_cache[0] = source
+    snapshot = _clone_checkpoint_kwarg(cache)
+    cache.key_cache[0] = torch.tensor([99.0])
+
+    assert snapshot.key_cache[0].item() == 2.0
+    snapshot.key_cache[0].sum().backward()
+    assert source.grad is not None and source.grad.item() == 1.0
 
 
 def test_trainside_ema_is_restored_after_generate() -> None:
