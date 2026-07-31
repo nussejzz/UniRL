@@ -11,6 +11,8 @@
 
 *One `RewardService` wraps **one backend**: a single in-process scorer (local) or a remote HTTP server that runs and weight-aggregates a **panel** of reward models. The per-sample reward it attaches is what the trainer z-scores into the advantage.*
 
+Design proposal: [rank-affine, environment-isolated reward roles](RANK_AFFINE_REWARD_DESIGN.md).
+
 ## What it is
 
 `unirl.reward` scores what a rollout produced — an image, a video, or text — and

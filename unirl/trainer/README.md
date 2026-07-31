@@ -51,6 +51,12 @@ stay swappable by `_target_`.
   concatenate those turn Parts for training. `RewardBackpropTrainer` is the one
   intentional exception: ReFL differentiates directly through decoded images and
   therefore does not use rollout Samples or advantages.
+- **Diffusion role residency is opt-in.** `rollout_sleep_after_generate=true`
+  preserves phase-based rollout sleep (the default); `false` keeps an external
+  engine's weights resident across rollout/reward/train. `enable_fsdp_offload`
+  remains the orthogonal train-state switch: external rollout may borrow train
+  memory during generation, while trainside rollout may borrow it only after
+  generation during reward scoring.
 
 The current trainer surface is:
 
@@ -257,5 +263,9 @@ an evaluation and checkpoint fall on the same step, evaluation runs first.
   trainside sampling reads the live training weights and needs none (`self.weight_sync` stays `None`).
 - **FSDP offload during `generate` is off by default** and force-gated off for trainside
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
+- **DP geometry has two batch dimensions.** Rollout/reward shard complete root
+  prompt trees, so `batch_size` must divide their DP sizes. The train stack shards
+  generated rows, so `batch_size * samples_per_prompt / train_dp_size` must divide
+  `num_updates_per_batch`.
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).

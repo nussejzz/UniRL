@@ -3,7 +3,8 @@ import inspect
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
@@ -20,6 +21,55 @@ from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_diffusion_dp_geometry(
+    *,
+    batch_size: int,
+    samples_per_prompt: int,
+    num_updates_per_batch: int,
+    rollout_dp_size: int,
+    reward_dp_size: int,
+    train_dp_size: int,
+) -> None:
+    """Validate prompt-tree dispatch separately from generated-sample training.
+
+    Rollout and reward receive a ``Sample`` and therefore shard its root prompt
+    trees. The train stack receives the generated frontier ``Part`` and shards its
+    flattened rows. Treating both as ``batch_size * samples_per_prompt`` hides the
+    common ``8 prompts / DP16`` failure until the distributed call.
+    """
+    values = {
+        "batch_size": batch_size,
+        "samples_per_prompt": samples_per_prompt,
+        "num_updates_per_batch": num_updates_per_batch,
+        "rollout_dp_size": rollout_dp_size,
+        "reward_dp_size": reward_dp_size,
+        "train_dp_size": train_dp_size,
+    }
+    invalid = {name: value for name, value in values.items() if int(value) < 1}
+    if invalid:
+        raise ValueError(f"Diffusion DP geometry values must be positive; got {invalid}.")
+
+    for role, dp_size in (("rollout", rollout_dp_size), ("reward", reward_dp_size)):
+        if batch_size % dp_size:
+            raise ValueError(
+                f"batch_size={batch_size} root prompt trees must be divisible by "
+                f"{role} dp_size={dp_size}; DP_SCATTER preserves each prompt's whole subtree."
+            )
+
+    total_generated = batch_size * samples_per_prompt
+    if total_generated % train_dp_size:
+        raise ValueError(
+            f"batch_size({batch_size}) * samples_per_prompt({samples_per_prompt}) = "
+            f"{total_generated} generated samples must be divisible by train dp_size={train_dp_size}."
+        )
+    per_train_rank = total_generated // train_dp_size
+    if per_train_rank % num_updates_per_batch:
+        raise ValueError(
+            f"Per-train-rank generated batch {per_train_rank} must be divisible by "
+            f"num_updates_per_batch={num_updates_per_batch}."
+        )
 
 
 class DiffusionTrainer(BaseTrainer):
@@ -50,6 +100,7 @@ class DiffusionTrainer(BaseTrainer):
         train_fraction: float = 0.5,
         reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
+        rollout_sleep_after_generate: bool = True,
         adv_use_global_std: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = 64,
@@ -70,6 +121,10 @@ class DiffusionTrainer(BaseTrainer):
         # default; only safe (and only set true) for layout=="colocate" with a
         # SEPARATE engine rollout under GRPO — gated again in train_step.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        # Process lifetime is independent from weight residency. False keeps an
+        # external rollout engine's weights resident after generate/eval; the
+        # default preserves the historical phase-sleep behavior.
+        self._rollout_sleep_after_generate = bool(rollout_sleep_after_generate)
         # FlowDPPO advantage parity: when True, Part.compute_advantages
         # keeps the per-group mean but divides by ONE batch-wide std (the v1
         # ``use_global_std=True`` scale) instead of each prompt's own std. Off by
@@ -205,20 +260,14 @@ class DiffusionTrainer(BaseTrainer):
                 self.reward = remote_hydra(reward_cfg)
                 self._wire_eval_suites()
 
-        # Pre-flight for the reward_fraction footgun: when reward takes its own
-        # slab the policy/rollout DP is the REDUCED card count, and the per-rollout
-        # sample count must divide BOTH the rollout DP and the reward DP — else the
-        # DP_SCATTER fails deep in generate()/score_and_attach with an opaque "not
-        # divisible by dp_size" error. Fail early here, naming the knob.
-        n_samples = batch_size * total_samples_per_prompt(self.sampling_params)
-        if n_samples % self.rollout.dp_size or n_samples % self.reward.dp_size:
-            raise ValueError(
-                f"batch_size({batch_size}) * samples_per_prompt = {n_samples} samples/rollout must be "
-                f"divisible by BOTH rollout dp_size={self.rollout.dp_size} and reward dp_size="
-                f"{self.reward.dp_size}. reward_fraction={reward_fraction} placed reward on its own slab, "
-                f"leaving the policy/rollout on {self.rollout.dp_size} GPU(s) — pick batch_size * "
-                f"samples_per_prompt divisible by both."
-            )
+        _validate_diffusion_dp_geometry(
+            batch_size=int(batch_size),
+            samples_per_prompt=total_samples_per_prompt(self.sampling_params),
+            num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
+            rollout_dp_size=int(self.rollout.dp_size),
+            reward_dp_size=int(self.reward.dp_size),
+            train_dp_size=int(self.stack.dp_size),
+        )
 
     def _wire_eval_suites(self) -> None:
         """Build the ``eval_rewards`` suites in the CALLER's placement scope.
@@ -440,6 +489,56 @@ class DiffusionTrainer(BaseTrainer):
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
 
+    def _offload_for_reward_phase(self) -> bool:
+        """Whether a trainside rollout may lend the train cards to reward."""
+        return self._enable_fsdp_offload and self._rollout_is_trainside and not self._uses_ema
+
+    @contextmanager
+    def _reward_phase(self) -> Iterator[None]:
+        """Temporarily offload trainside FSDP state while reward is active."""
+        should_offload = self._offload_for_reward_phase()
+        if should_offload:
+            self.backend.offload()
+        try:
+            yield
+        finally:
+            if should_offload:
+                self.backend.onload()
+
+    def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
+        """Generate with exception-safe EMA, rollout, and FSDP lifecycle cleanup."""
+        self.rollout.wake_up()
+        should_offload_train = (
+            self._enable_fsdp_offload
+            and self._layout != "separate"
+            and not self._rollout_is_trainside
+            and not self._uses_ema
+        )
+        should_swap_ema = self._uses_ema and self._rollout_is_trainside
+        train_offloaded = False
+        ema_applied = False
+        try:
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.sync()
+            if should_offload_train:
+                self.backend.offload()
+                train_offloaded = True
+            if should_swap_ema:
+                self.backend.apply_eval_ema()
+                ema_applied = True
+            return self.rollout.generate(sample)
+        finally:
+            try:
+                if ema_applied:
+                    self.backend.restore_from_eval()
+            finally:
+                try:
+                    if self._rollout_sleep_after_generate:
+                        self.rollout.sleep()
+                finally:
+                    if train_offloaded:
+                        self.backend.onload()
+
     def train_step(
         self,
         sample: Sample,
@@ -463,45 +562,9 @@ class DiffusionTrainer(BaseTrainer):
         per-sample reward of the frontier gen Part (0.0 if none), for the log line.
         """
         t0 = time.perf_counter()
-        self.rollout.wake_up()
-        if sync_weights and self.weight_sync is not None:
-            self.weight_sync.sync()
-        # Colocate FSDP offload: free the train state (params+grads+optimizer)
-        # for the memory-heavy generate when a SEPARATE engine does the rollout.
-        # Gated off for the trainside rollout (reuses the train model → can't be
-        # offloaded) and for DiffusionNFT (``_uses_ema``; its EMA adapter swap touches the
-        # backend around generate). Off by default. ``sync`` above needs the base
-        # onloaded, so offload only AFTER it.
-        _do_fsdp_offload = (
-            self._enable_fsdp_offload
-            and self._layout != "separate"
-            and not self._rollout_is_trainside
-            and not self._uses_ema  # _uses_ema == "is DiffusionNFT"
-        )
-        if _do_fsdp_offload:
-            self.backend.offload()
-        # DiffusionNFT samples under the EMA-smoothed ("old") adapter. HOW "old"
-        # reaches the rollout depends on topology, so each mechanism fires only in
-        # its own regime (never both):
-        #   - trainside engine: it reuses THIS process's model, so swap the adapter
-        #     in place around generate and restore "default" before the loss.
-        #   - separate engine (sglang/vllm): runs in its own process and receives
-        #     "old" via the weight sync's merged push (backend.rollout_adapter_name);
-        #     the in-process swap cannot reach it, so skip the wasted swap + RPC.
-        # No-op for GRPO (gated on _uses_ema).
-        _inproc_ema_swap = self._uses_ema and self._rollout_is_trainside
-        if _inproc_ema_swap:
-            self.backend.apply_eval_ema()
-        sample = self.rollout.generate(sample)
-        if _inproc_ema_swap:
-            self.backend.restore_from_eval()
-        self.rollout.sleep()
-        if _do_fsdp_offload:
-            self.backend.onload()
-
-        # Score the frontier gen Part (Sample -> Sample; the reward service is
-        # migrated alongside on its own branch — see the LIN-480 plan).
-        sample = self.reward.score_and_attach(sample)
+        sample = self._generate_for_training(sample, sync_weights=sync_weights)
+        with self._reward_phase():
+            sample = self.reward.score_and_attach(sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -540,10 +603,9 @@ class DiffusionTrainer(BaseTrainer):
         returns ``eval/reward``.
 
         ``sync_weights=False`` evaluates the policy already resident in the rollout
-        engine without changing its weight version, and ``sleep_after=False`` leaves
-        a dedicated engine resident afterwards — what the async trainer needs so
-        evaluation does not perturb its pipeline. The defaults preserve the
-        synchronous trainer's existing behavior.
+        engine without changing its weight version. The engine sleeps afterward
+        only when both ``sleep_after`` and ``rollout_sleep_after_generate`` are true;
+        the async trainer and fully resident recipes disable the appropriate knob.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict
         # (mirrors the AR trainer's evaluate()). ``cfg_text_scale`` only exists
@@ -575,7 +637,7 @@ class DiffusionTrainer(BaseTrainer):
                     n = suite.num_prompts or self.eval_num_prompts
                     metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
         finally:
-            if sleep_after:
+            if sleep_after and self._rollout_sleep_after_generate:
                 self.rollout.sleep()
         logger.info(
             "EVAL step %d  (%d samples/prompt, cfg=%.1f eta=%.1f)  %s",
@@ -612,16 +674,17 @@ class DiffusionTrainer(BaseTrainer):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
-            for name, reward in scorers:
-                # Every scorer receives the same unscored Sample. Feeding one
-                # scorer's returned Sample into the next would be rejected as a
-                # pre-scored frontier and would couple otherwise independent suites.
-                scored = reward.score_and_attach(generated)
-                rewards = scored.parts[-1].rewards
-                if rewards is not None:
-                    r = hydrate(rewards).to(torch.float32)
-                    sums[name] += float(r.sum().item())
-                    counts[name] += int(r.numel())
+            with self._reward_phase():
+                for name, reward in scorers:
+                    # Every scorer receives the same unscored Sample. Feeding one
+                    # scorer's returned Sample into the next would be rejected as a
+                    # pre-scored frontier and would couple otherwise independent suites.
+                    scored = reward.score_and_attach(generated)
+                    rewards = scored.parts[-1].rewards
+                    if rewards is not None:
+                        r = hydrate(rewards).to(torch.float32)
+                        sums[name] += float(r.sum().item())
+                        counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def train(
