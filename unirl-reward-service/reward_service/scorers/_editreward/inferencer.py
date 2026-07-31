@@ -125,6 +125,7 @@ class EditRewardInferencer:
         self,
         config_path=None,
         checkpoint_path=None,
+        model_name_or_path=None,
         device="cuda",
         differentiable=False,
         reward_dim="dim1",
@@ -139,8 +140,11 @@ class EditRewardInferencer:
                 is_train=False,
             )
         )
+        if model_name_or_path:
+            model_config.model_name_or_path = str(model_name_or_path)
         training_args.output_dir = os.path.join(
-            training_args.output_dir, config_path.split("/")[-1].split(".")[0]
+            training_args.output_dir or "/tmp/editreward_output",
+            config_path.split("/")[-1].split(".")[0],
         )
 
         model, processor, _ = _create_model_and_processor(

@@ -29,6 +29,7 @@ class EditRewardScorer(BaseScorer):
         self,
         checkpoint_path: str,
         config_path: str | None = None,
+        model_name_or_path: str | None = None,
         device: str = "cuda",
         dtype: str = "bfloat16",
         rm_head_type: str = "ranknet_multi_head",
@@ -53,6 +54,7 @@ class EditRewardScorer(BaseScorer):
         self.inferencer = EditRewardInferencer(
             config_path=config_path,
             checkpoint_path=checkpoint_path,
+            model_name_or_path=model_name_or_path,
             device=initial_device,
             reward_dim="dim1",
             rm_head_type=rm_head_type,

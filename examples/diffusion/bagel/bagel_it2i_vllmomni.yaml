@@ -64,6 +64,9 @@ workers_per_device: 1
 # rollouts the loop pushes the freshly-trained adapter into the vLLM-Omni engine.
 # 1 = on-policy; >1 lags rollout weights (off-policy drift).
 weight_sync_interval: 1
+# Process lifetime is always persistent. True releases vLLM weight memory between
+# phases; set false only after a measured resident Train+Rollout+Reward budget fits.
+rollout_sleep_after_generate: true
 
 # NB: no `stage_config.task: it2i` here. On the trainside recipe that pin is what
 # makes a source-image-less dataset fail loudly; on this path the modality does it —

@@ -50,6 +50,7 @@ class DiffusionTrainer(BaseTrainer):
         train_fraction: float = 0.5,
         reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
+        rollout_sleep_after_generate: bool = True,
         adv_use_global_std: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = 64,
@@ -69,6 +70,9 @@ class DiffusionTrainer(BaseTrainer):
         #   AFTER generate while a colocated external reward model is on GPU.
         # Both paths onload before backward. Gated again in train_step/eval.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        # Keep the rollout process alive in both modes; this knob controls only
+        # whether its GPU weights are released after each generate/eval pass.
+        self._rollout_sleep_after_generate = bool(rollout_sleep_after_generate)
         # FlowDPPO advantage parity: when True, RolloutTrack.compute_advantages
         # keeps the per-group mean but divides by ONE batch-wide std (the v1
         # ``use_global_std=True`` scale) instead of each prompt's own std. Off by
@@ -482,7 +486,8 @@ class DiffusionTrainer(BaseTrainer):
         resp = self.rollout.generate(req)
         if _inproc_ema_swap:
             self.backend.restore_from_eval()
-        self.rollout.sleep()
+        if self._rollout_sleep_after_generate:
+            self.rollout.sleep()
         if _do_fsdp_offload:
             self.backend.onload()
 
@@ -565,7 +570,8 @@ class DiffusionTrainer(BaseTrainer):
             if suite.data_source is not None:
                 n = suite.num_prompts or self.eval_num_prompts
                 metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
-        self.rollout.sleep()
+        if self._rollout_sleep_after_generate:
+            self.rollout.sleep()
         logger.info(
             "EVAL step %d  (%d samples/prompt, cfg=%.1f eta=%.1f)  %s",
             step,
