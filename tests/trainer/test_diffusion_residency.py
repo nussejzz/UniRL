@@ -257,6 +257,7 @@ def test_checkpoint_kwarg_clone_snapshots_mutable_kv_cache() -> None:
     cache.key_cache[0] = torch.tensor([99.0])
 
     assert snapshot.key_cache[0].item() == 2.0
+    assert snapshot.key_cache[0] is source
     snapshot.key_cache[0].sum().backward()
     assert source.grad is not None and source.grad.item() == 1.0
 

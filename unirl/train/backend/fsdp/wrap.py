@@ -21,18 +21,15 @@ logger = logging.getLogger(__name__)
 
 
 def _clone_checkpoint_kwarg(value: Any) -> Any:
-    """Snapshot mutable KV-cache kwargs for deterministic checkpoint replay."""
+    """Snapshot mutable KV-cache mappings without duplicating tensor storage."""
     if not (hasattr(value, "key_cache") and hasattr(value, "value_cache")):
         return value
     cloned = type(value)(value.num_layers)
-    cloned.key_cache = {
-        index: (tensor.clone() if isinstance(tensor, torch.Tensor) else tensor)
-        for index, tensor in value.key_cache.items()
-    }
-    cloned.value_cache = {
-        index: (tensor.clone() if isinstance(tensor, torch.Tensor) else tensor)
-        for index, tensor in value.value_cache.items()
-    }
+    # BAGEL cache updates replace per-layer entries; they do not mutate the
+    # existing K/V tensors. Copying the mappings is therefore sufficient to
+    # freeze replay state and avoids O(num_layers**2) tensor duplication.
+    cloned.key_cache = dict(value.key_cache)
+    cloned.value_cache = dict(value.value_cache)
     return cloned
 
 
