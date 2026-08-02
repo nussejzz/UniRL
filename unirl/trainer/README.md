@@ -53,10 +53,11 @@ stay swappable by `_target_`.
   therefore does not use rollout Samples or advantages.
 - **Diffusion role residency is opt-in.** `rollout_sleep_after_generate=true`
   preserves phase-based rollout sleep (the default); `false` keeps an external
-  engine's weights resident across rollout/reward/train. `enable_fsdp_offload`
-  remains the orthogonal train-state switch: external rollout may borrow train
-  memory during generation, while trainside rollout may borrow it only after
-  generation during reward scoring.
+  engine's weights resident across rollout/reward/train. Train-state policies are
+  independent: `enable_fsdp_offload` lets an external rollout borrow train memory
+  during generation, while `offload_train_during_reward` lets a reward sharing the
+  train slab borrow it during scoring. A reward on a separate `reward_fraction`
+  slab never triggers train offload.
 
 The current trainer surface is:
 
