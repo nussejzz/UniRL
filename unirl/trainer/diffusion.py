@@ -134,6 +134,7 @@ class DiffusionTrainer(BaseTrainer):
         train_fraction: float = 0.5,
         reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
+        offload_train_during_reward: bool = False,
         rollout_sleep_after_generate: bool = True,
         adv_use_global_std: bool = False,
         eval_interval: int = 0,
@@ -155,6 +156,9 @@ class DiffusionTrainer(BaseTrainer):
         # default; only safe (and only set true) for layout=="colocate" with a
         # SEPARATE engine rollout under GRPO — gated again in train_step.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        # Independent from generate-time offload: when enabled, a reward that
+        # shares the train slab may borrow its GPU after generation completes.
+        self._offload_train_during_reward = bool(offload_train_during_reward)
         # Process lifetime is independent from weight residency. False keeps an
         # external rollout engine's weights resident after generate/eval; the
         # default preserves the historical phase-sleep behavior.
@@ -248,6 +252,7 @@ class DiffusionTrainer(BaseTrainer):
                 f"+ reward_fraction ({reward_fraction}) must be < 1.0"
             )
         reward_separate = reward_fraction > 0.0
+        self._reward_is_separate = reward_separate
 
         # Construction (_build_train_side / _build_rollout) is shared; only the
         # placement topology and the train→rollout sync wiring differ per layout.
@@ -524,12 +529,12 @@ class DiffusionTrainer(BaseTrainer):
         return request
 
     def _offload_for_reward_phase(self) -> bool:
-        """Whether a trainside rollout may lend the train cards to reward."""
-        return self._enable_fsdp_offload and self._rollout_is_trainside and not self._uses_ema
+        """Whether a colocated reward may temporarily borrow the train cards."""
+        return self._offload_train_during_reward and not self._reward_is_separate and not self._uses_ema
 
     @contextmanager
     def _reward_phase(self) -> Iterator[None]:
-        """Temporarily offload trainside FSDP state while reward is active."""
+        """Temporarily offload FSDP state while a colocated reward is active."""
         should_offload = self._offload_for_reward_phase()
         offload_attempted = False
         try:
