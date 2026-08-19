@@ -18,7 +18,7 @@ uv pip install -e ".[vllm,train,infer]"
 The vLLM extra temporarily pins the reviewed commit from
 `nussejzz/vllm-omni` that backs the MiniMax-H3 integration. Replace this
 direct reference with the first upstream vLLM-Omni release containing PR
-`#6351`.
+`#6351`. This stack targets vLLM 0.27, PyTorch 2.13, and CUDA 13.0.
 
 ## sglang
 

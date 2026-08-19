@@ -19,7 +19,7 @@ dependencies = [
   # one engine extra below, which is what allows the per-engine CUDA stacks.
   "numpy>=1.24,<3",
   "ray[default]>=2.9",
-  "diffusers>=0.38.0",  # LTX-2 needs 0.38: transformer.forward gained sigma/audio_sigma/isolate_modalities/use_cross_timestep, connector gained padding_side, calculate_shift now pins image_seq_len to max_image_seq_len. (>=0.37 was already required for Qwen-Image RoPE text-len-from-mask; 0.38 verified to keep that + every other model API unchanged.)
+  "diffusers==0.38.0",  # Shared engine baseline; Cosmos3 intentionally uses a separate >=0.39 environment.
   "hydra-core>=1.3",
   "omegaconf>=2.3",
   # Engine extras narrow this shared range to their validated runtime.
@@ -33,7 +33,7 @@ dependencies = [
   # removed in 5.x and fails at import against the transformers pin above.
   # exclude_modules support (>=0.14) used by LoRA/NFT adapter injection.
   "peft>=0.20",
-  "safetensors>=0.4",
+  "safetensors>=0.8.0",
   "Pillow>=10",
   "requests>=2.31",
   "psutil>=5.9",
@@ -78,11 +78,11 @@ sglang = [
 # DELETE-WHEN: vLLM-Omni releases the two commits from upstream PR #6351;
 # replace the direct reference with that release pin.
 vllm = [
-  "vllm==0.26.0 ; sys_platform == 'linux'",
-  "vllm-omni @ git+https://github.com/nussejzz/vllm-omni.git@30bc8a8f2a6220e6b3af6781574e179957082ec0 ; sys_platform == 'linux'",
+  "vllm==0.27.0 ; sys_platform == 'linux'",
+  "vllm-omni @ git+https://github.com/nussejzz/vllm-omni.git@a4759624cd52fb9b353c1f66463be1a221f9e5fa ; sys_platform == 'linux'",
   "transformers>=5.10.1,<5.15",
-  "torch==2.11.0+cu130 ; sys_platform == 'linux'",
-  "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
+  "torch==2.13.0+cu130 ; sys_platform == 'linux'",
+  "torchvision==0.28.0+cu130 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu130 ; sys_platform == 'linux'",
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
@@ -163,7 +163,7 @@ override-dependencies = [
   # sglang[diffusion] hard-pins diffusers==0.37.0 (still pinned on sglang main),
   # colliding with the base diffusers>=0.38.0 floor (#91); override to the floor
   # so ".[sglang,...]" stays solvable (same tactic as kernels/tokenizers above).
-  "diffusers>=0.38.0",
+  "diffusers==0.38.0",
 ]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -179,7 +179,7 @@ environments = [
 [tool.uv.extra-build-dependencies]
 vllm = [
   "numpy",
-  "torch==2.11.0+cu130",
+  "torch==2.13.0+cu130",
 ]
 
 [[tool.uv.index]]

@@ -342,7 +342,7 @@ class VLLMOmniBackend:
         omni = self._require_omni()
         for sid in self._stage_ids():
             task_id = str(uuid.uuid4())
-            acks = omni.engine.collective_rpc(
+            acks = omni.collective_rpc(
                 method="handle_sleep_task",
                 args=(self._rt["OmniSleepTask"](level=1, task_id=task_id),),
                 stage_ids=[int(sid)],
@@ -358,7 +358,7 @@ class VLLMOmniBackend:
         omni = self._require_omni()
         for sid in self._stage_ids():
             task_id = str(uuid.uuid4())
-            acks = omni.engine.collective_rpc(
+            acks = omni.collective_rpc(
                 method="handle_wake_task",
                 args=(self._rt["OmniWakeTask"](tags=None, task_id=task_id),),
                 stage_ids=[int(sid)],
@@ -400,7 +400,7 @@ class VLLMOmniBackend:
             "replica_rank": replica_rank,
         }
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            omni.collective_rpc(
                 method="update_weights_from_ipc",
                 args=(),
                 kwargs={**kwargs, "stage_id": int(sid)},
@@ -427,7 +427,7 @@ class VLLMOmniBackend:
             "backend": str(backend),
         }
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            omni.collective_rpc(
                 method="init_weights_update_group",
                 args=(),
                 kwargs=kwargs,
@@ -454,7 +454,7 @@ class VLLMOmniBackend:
             "flush_cache": bool(flush_cache),
         }
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            omni.collective_rpc(
                 method="update_weights_from_distributed",
                 args=(),
                 kwargs=kwargs,
@@ -465,7 +465,7 @@ class VLLMOmniBackend:
         if self._omni is None:
             return
         for sid in self._stage_ids():
-            self._omni.engine.collective_rpc(
+            self._omni.collective_rpc(
                 method="destroy_weights_update_group",
                 args=(),
                 kwargs={"group_name": str(group_name)},
@@ -489,7 +489,7 @@ class VLLMOmniBackend:
             "flush_cache": bool(flush_cache),
         }
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            omni.collective_rpc(
                 method="update_weights_from_tensor",
                 args=(),
                 kwargs=kwargs,
@@ -525,7 +525,7 @@ class VLLMOmniBackend:
                 name: t.detach().clone() if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
             }
             serialized = MultiprocessingSerializer.serialize(cloned, output_str=True)
-            omni.engine.collective_rpc(
+            omni.collective_rpc(
                 method="set_lora_from_tensor_dict",
                 args=(
                     str(adapter_name) or DIFFRL_LORA_NAME,
@@ -571,7 +571,7 @@ class VLLMOmniBackend:
             torch.save(cpu_tensors, payload_path)
             markers = [f"/tmp/diffrl_lora_ready_{ready_token}_{rank}" for rank in range(worker_count)]
             try:
-                result = omni.engine.collective_rpc(
+                result = omni.collective_rpc(
                     method="set_lora_from_tensor_file",
                     timeout=timeout_s,
                     args=(
@@ -583,7 +583,6 @@ class VLLMOmniBackend:
                         ready_token,
                     ),
                     unique_reply_rank=0,
-                    exec_all_ranks=True,
                     stage_ids=[int(sid)],
                 )
                 self._raise_for_control_rpc_error(result, method="set_lora_from_tensor_file")
@@ -640,7 +639,7 @@ class VLLMOmniBackend:
         omni = self._require_omni()
         for sid in self._stage_ids():
             try:
-                omni.engine.collective_rpc(
+                omni.collective_rpc(
                     method="remove_lora",
                     args=(int(adapter_id),),
                     stage_ids=[int(sid)],
@@ -653,7 +652,7 @@ class VLLMOmniBackend:
         omni = self._require_omni()
         out: dict = {}
         for sid in self._stage_ids():
-            results = omni.engine.collective_rpc(
+            results = omni.collective_rpc(
                 method="_diffrl_loaded_param_checksums",
                 args=(list(names),),
                 stage_ids=[int(sid)],
@@ -666,7 +665,7 @@ class VLLMOmniBackend:
         omni = self._require_omni()
         out: dict = {}
         for sid in self._stage_ids():
-            results = omni.engine.collective_rpc(
+            results = omni.collective_rpc(
                 method="_diffrl_loaded_lora_checksums",
                 args=(int(adapter_id), list(names) if names else None),
                 stage_ids=[int(sid)],
