@@ -79,7 +79,7 @@ sglang = [
 # replace the direct reference with that release pin.
 vllm = [
   "vllm==0.26.0 ; sys_platform == 'linux'",
-  "vllm-omni @ git+https://github.com/nussejzz/vllm-omni.git@175ac5e5f4a21092e6b47a46b27c68398e2b342f ; sys_platform == 'linux'",
+  "vllm-omni @ git+https://github.com/nussejzz/vllm-omni.git@30bc8a8f2a6220e6b3af6781574e179957082ec0 ; sys_platform == 'linux'",
   "transformers>=5.10.1,<5.15",
   "torch==2.11.0+cu130 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
