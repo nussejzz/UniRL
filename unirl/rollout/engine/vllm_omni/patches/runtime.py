@@ -141,10 +141,14 @@ def patch_qwen3_omni_thinker_lora() -> None:
     if importlib.util.find_spec(module_name) is None:
         return
 
-    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-        Qwen3OmniMoeThinkerForConditionalGeneration,
-        Qwen3OmniMoeThinkerMultiModalProcessor,
-    )
+    try:
+        from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+            Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeThinkerMultiModalProcessor,
+        )
+    except ImportError as exc:
+        logger.warning("Skipping optional Qwen3-Omni Thinker patches: %s", exc)
+        return
 
     from unirl.rollout.engine.vllm_omni.patches.compat_qwen3_omni import (
         patch_qwen3_omni_audio_truncation,
@@ -219,8 +223,23 @@ def patch_dit_lora_loader() -> None:
             list(lora_model.loras.keys()),
         )
 
-        for lora in lora_model.loras.values():
-            lora.optimize()
+        import torch
+
+        previous_threads = torch.get_num_threads()
+        logger.debug(
+            "Optimizing %d LoRA modules with one CPU thread (previously %d)",
+            len(lora_model.loras),
+            previous_threads,
+        )
+        # Four SP workers otherwise each fan this simple CPU scaling loop out
+        # over the host's full OpenMP pool. On H3's 300-module adapter that
+        # oversubscription leaves half the workers stuck indefinitely.
+        torch.set_num_threads(1)
+        try:
+            for lora in lora_model.loras.values():
+                lora.optimize()
+        finally:
+            torch.set_num_threads(previous_threads)
 
         return lora_model, peft_helper
 
