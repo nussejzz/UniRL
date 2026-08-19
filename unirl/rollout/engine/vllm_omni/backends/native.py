@@ -89,7 +89,7 @@ def _assemble_omni_kwargs(intent: Dict[str, Any]) -> Dict[str, Any]:
     if intent.get("enable_sleep_mode"):
         omni_kwargs["enable_sleep_mode"] = True
     ports = intent.get("ports")
-    if ports is not None:
+    if ports is not None and intent.get("use_stage_yaml", True):
         omni_kwargs["master_port"] = int(ports.master_port)
     return omni_kwargs
 
@@ -151,8 +151,15 @@ class VLLMOmniBackend:
         except Exception:  # noqa: BLE001 - belt and braces; never block a boot
             pass
 
-        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
+        use_stage_yaml = bool(intent.get("use_stage_yaml", True))
+        yaml_path = (
+            _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
+            if use_stage_yaml
+            else None
+        )
         omni_kwargs = _assemble_omni_kwargs(intent)
+        if yaml_path is not None:
+            omni_kwargs["stage_configs_path"] = yaml_path
         logger.info(
             "VLLM-Omni boot intent (before engine startup):\n%s",
             pformat(
@@ -173,7 +180,6 @@ class VLLMOmniBackend:
                     fcntl.flock(lock_file, fcntl.LOCK_EX)
                 omni = rt["Omni"](
                     model=str(intent["model_path"]),
-                    stage_configs_path=yaml_path,
                     **omni_kwargs,
                 )
             finally:
@@ -593,10 +599,8 @@ class VLLMOmniBackend:
                         payload_path,
                         ready_token,
                     ),
-                    kwargs={
-                        "_diffrl_unique_reply_rank": 0,
-                        "_diffrl_exec_all_ranks": True,
-                    },
+                    unique_reply_rank=0,
+                    exec_all_ranks=True,
                     stage_ids=[int(sid)],
                 )
                 self._raise_for_control_rpc_error(result, method="set_lora_from_tensor_file")
