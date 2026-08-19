@@ -21,14 +21,7 @@ from .vendor import (
 
 
 class MiniMaxH3Bundle(Bundle):
-    """Loaded MiniMax-H3 components.
-
-    No scheduler is held. MiniMax-H3's two rectified-flow grids are plain
-    ``shift*t / (1 + (shift-1)*t)`` over ``linspace(1, 0, N)``, which UniRL's
-    static ``FlowMatchSchedulePolicy`` reproduces exactly -- so sigma is pinned
-    onto the generation Part by the hosting engine like every other model here,
-    and a ``MiniMaxH3Scheduler`` instance would be a second source of truth.
-    """
+    """Loaded MiniMax-H3 components."""
 
     def __init__(
         self,

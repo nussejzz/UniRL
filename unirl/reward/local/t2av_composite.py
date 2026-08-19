@@ -24,9 +24,7 @@ class T2AVCompositeScorer(RewardBackend):
         # switch off expensive modalities without retaining their model or
         # allowing a failed/NaN scorer to poison the composite.
         self.weights: Dict[str, float] = {
-            str(name): float(weight)
-            for name, weight in dict(config.weights or {}).items()
-            if float(weight) != 0.0
+            str(name): float(weight) for name, weight in dict(config.weights or {}).items() if float(weight) != 0.0
         }
         if not self.weights:
             raise ValueError("T2AVCompositeScorer requires at least one non-zero weight.")
@@ -101,13 +99,7 @@ class T2AVCompositeScorer(RewardBackend):
 
 @dataclass
 class T2AVCompositeSpec(BaseRewardComponentSpec):
-    """Typed config for the T2AV composite reward.
-
-    ``weights`` maps inner scorer canonical names (e.g. ``videopickscore``,
-    ``clap``, ``imagebind``) to blend weights. Each named scorer is built from
-    its default Spec with ``device``/``batch_size``/``frame_selection``
-    propagated (only to inner specs that declare the field).
-    """
+    """Typed config for the T2AV composite reward."""
 
     batch_size: int = 8
     device: str = "auto"

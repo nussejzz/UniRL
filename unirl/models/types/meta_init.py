@@ -176,14 +176,7 @@ def recover_rope_inv_freq(model: nn.Module) -> int:
 
 
 def _pin_fp32(transformer: nn.Module, keep_in_fp32: Sequence[str]) -> int:
-    """Re-cast params/buffers whose name matches ``keep_in_fp32`` back to fp32.
-
-    Entries are matched as **substrings of the parameter name**, the convention
-    diffusers' own ``_keep_in_fp32_modules`` uses. On meta the re-cast is
-    metadata-only, so ``to_empty`` later allocates each tensor at its own dtype
-    and the sharded load lands a mixed-dtype module exactly as the checkpoint
-    stores it.
-    """
+    """Re-cast params/buffers whose name matches ``keep_in_fp32`` back to fp32."""
     patterns = tuple(keep_in_fp32)
     pinned = 0
     for name, tensor in list(transformer.named_parameters()) + list(transformer.named_buffers()):
@@ -201,22 +194,7 @@ def finalize_meta_init(
     dtype: torch.dtype,
     keep_in_fp32: Optional[Sequence[str]] = None,
 ) -> nn.Module:
-    """Apply the shared post-build contract for a meta transformer.
-
-    The dtype cast is metadata-only on meta parameters, so ``to_empty`` later
-    allocates the requested master dtype directly. VeOmni calls
-    ``init_weights`` after materialization; replace it with a no-op because the
-    real checkpoint is loaded immediately afterwards.
-
-    ``keep_in_fp32`` is an **opt-in** escape from the single-dtype assumption,
-    for checkpoints that are genuinely mixed-precision (MiniMax-H3 keeps its
-    patch projections, timestep MLP and output heads in fp32 while the block
-    stack is bf16). ``None`` -- the default -- reproduces the historical
-    uniform cast exactly, so no existing bundle changes behaviour. Pass the
-    model's own ``_keep_in_fp32_modules`` explicitly; it is deliberately NOT
-    auto-detected, because several diffusers classes declare that attribute
-    while their UniRL bundles have always loaded (and trained) uniformly.
-    """
+    """Apply the shared post-build contract for a meta transformer."""
     if not any(param.is_meta for param in transformer.parameters()):
         raise ValueError("finalize_meta_init requires a transformer with meta parameters.")
     transformer = transformer.to(dtype)

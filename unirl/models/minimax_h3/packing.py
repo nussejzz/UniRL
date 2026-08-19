@@ -1,20 +1,4 @@
-"""Geometry resolution and packed-row layout for MiniMax-H3 t2va.
-
-MiniMax-H3 runs its transformer over ONE packed 1-D sequence holding every
-modality at once. For t2va the row order is::
-
-    [ text (L) | target audio (A) | target video (V) ]
-
-(``fl2va`` inserts keyframe conditioning rows between text and audio; that is
-Track B and deliberately not built here, though the vendored builder already
-supports it via ``keyframe_anchors``.)
-
-This module is a thin resolver over the vendored builders -- the row geometry,
-the float64 rotary clock and the tag values are checkpoint contracts, so they
-are USED from ``vendor.packing`` rather than reimplemented. What lives here is
-only the mapping from UniRL's ``DiffusionSamplingParams`` to the arguments those
-builders want, plus the sigma -> timestep conversion.
-"""
+"""Geometry resolution and packed-row layout for MiniMax-H3 t2va."""
 
 from __future__ import annotations
 
@@ -44,14 +28,7 @@ from .vendor import (
 
 @dataclass(frozen=True)
 class MiniMaxH3Geometry:
-    """The resolved shape of one request. Depends only on SHARED sampling params.
-
-    Every field here is a pure function of ``(aspect, duration)``, never of
-    per-sample data. That is load-bearing: ``LatentSegment`` stores latents in a
-    ``FieldKind.CONCAT`` tensor, so ``torch.cat`` across the batch requires
-    identical non-batch dims. Per-sample geometry would need a varlen segment
-    UniRL does not have.
-    """
+    """The resolved shape of one request. Depends only on SHARED sampling params."""
 
     height: int
     width: int
@@ -91,21 +68,7 @@ class MiniMaxH3Geometry:
 
     @classmethod
     def resolve(cls, *, height: int, width: int, num_frames: int) -> "MiniMaxH3Geometry":
-        """Validate a requested ``(height, width, num_frames)`` against H3.
-
-        MiniMax-H3 does NOT accept an arbitrary canvas. It was released for a
-        768 pixel SHORT EDGE only, both axes a multiple of 32, area soft-capped
-        at 768x1344 -- so the canvas is a function of the aspect ratio alone.
-        Frame count is likewise snapped: the video VAE encodes 17 pixel frames
-        per chunk and drops 3 trailing latent frames, so only ``17n + 5`` counts
-        round-trip, and duration is clamped to [5, 15]s at a fixed 24 fps.
-
-        This raises rather than silently re-resolving. A recipe asking for
-        512x768 is not a slightly-off request that should be rounded -- it is
-        outside what the checkpoint can do, and quietly training at a different
-        resolution than the recipe states is exactly the kind of drift that is
-        impossible to spot later. The error carries the nearest legal values.
-        """
+        """Validate a requested ``(height, width, num_frames)`` against H3."""
         canvas_height, canvas_width = resolve_canvas_size(float(width), float(height))
         if (int(height), int(width)) != (canvas_height, canvas_width):
             raise ValueError(
@@ -138,12 +101,7 @@ class MiniMaxH3Geometry:
 
 
 def build_t2va_layout(geometry: MiniMaxH3Geometry, num_text_tokens: int) -> MiniMaxH3PackedSequence:
-    """Build the ``[text | audio | video]`` layout for a t2va request.
-
-    All text rows carry the text tag. (``fl2va`` tags the rows of a keyframe's
-    vision block as VIDEO instead -- that distinction only exists once keyframes
-    do, so t2va passes a uniform tag vector.)
-    """
+    """Build the ``[text | audio | video]`` layout for a t2va request."""
     text_token_tags = torch.full((int(num_text_tokens),), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
     return build_packed_sequence(
         text_token_tags=text_token_tags,
@@ -162,18 +120,7 @@ def row_timestep_plan(
     video_sigma: torch.Tensor,
     audio_sigma: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(unique_timesteps, timestep_indices)`` for one denoising step.
-
-    MiniMax-H3 conditions its AdaLN on ``t = 1 - sigma`` in ``[0, 1]``, UNSCALED
-    (no x1000) and with ``t = 1`` meaning clean -- the opposite direction to
-    every other model in this repo. Text rows never reach an output head and
-    inherit the video timestep.
-
-    t2va has no conditioning rows, so the condition timesteps are dead
-    arguments; they are passed as the video timestep so they cannot introduce a
-    spurious entry into the unique set if a future caller does add rows without
-    revisiting this.
-    """
+    """``(unique_timesteps, timestep_indices)`` for one denoising step."""
     video_t = float(1.0 - float(video_sigma))
     audio_t = float(1.0 - float(audio_sigma))
     return build_row_timesteps(
