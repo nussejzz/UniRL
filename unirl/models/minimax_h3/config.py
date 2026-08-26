@@ -66,6 +66,10 @@ class MiniMaxH3PipelineConfig:
     # audio<->video coupling the packed sequence creates. False denoises audio
     # with ODE (``eta=0``, no log-prob) so only video carries policy signal.
     audio_joint_sde: bool = True
+    # Optional fixed modality weights. ``None`` preserves the historical
+    # element-weighted joint density; (0.5, 0.5) matches verl-omni H3 #368.
+    av_logprob_video_weight: Optional[float] = None
+    av_logprob_audio_weight: Optional[float] = None
 
     # Generation defaults. MiniMax-H3 was released for a 768 pixel SHORT EDGE
     # only, with a soft area cap of 768x1344 and both axes rounded to a multiple
@@ -105,6 +109,13 @@ class MiniMaxH3PipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="MiniMaxH3PipelineConfig.model_precision")
+        video_weight = self.av_logprob_video_weight
+        audio_weight = self.av_logprob_audio_weight
+        if (video_weight is None) != (audio_weight is None):
+            raise ValueError("MiniMaxH3PipelineConfig requires both AV log-prob weights or neither.")
+        if video_weight is not None:
+            if float(video_weight) < 0 or float(audio_weight) < 0 or float(video_weight) + float(audio_weight) <= 0:
+                raise ValueError("MiniMaxH3PipelineConfig AV log-prob weights must be non-negative with positive sum.")
 
 
 __all__ = [

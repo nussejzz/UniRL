@@ -16,7 +16,7 @@ from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
 )
 from vllm_omni.diffusion.registry import _apply_sequence_parallel_if_enabled
 
-from unirl.sde.kernels import CPSSDEStrategy
+from unirl.sde.kernels import CPSSDEStrategy, CPSSpec
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.sampling import compute_trajectory_positions
@@ -170,6 +170,8 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         self._rl_video_means: list[torch.Tensor] = []
         self._rl_capture_transition_means = False
         self._rl_audio_joint_sde = True
+        self._rl_av_video_weight: Optional[float] = None
+        self._rl_av_audio_weight: Optional[float] = None
 
     @staticmethod
     def _request_span(request: Any) -> tuple[dict[str, Any], int, int]:
@@ -450,10 +452,18 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
                         policy_log_prob = video_log_prob
                         if self._rl_audio_joint_sde:
                             assert audio_log_prob is not None
-                            video_numel = int(video_velocity.numel())
-                            audio_numel = int(audio_velocity.numel())
-                            policy_log_prob = (video_log_prob * video_numel + audio_log_prob * audio_numel) / (
-                                video_numel + audio_numel
+                            video_weight = (
+                                float(video_velocity.numel())
+                                if self._rl_av_video_weight is None
+                                else self._rl_av_video_weight
+                            )
+                            audio_weight = (
+                                float(audio_velocity.numel())
+                                if self._rl_av_audio_weight is None
+                                else self._rl_av_audio_weight
+                            )
+                            policy_log_prob = (video_log_prob * video_weight + audio_log_prob * audio_weight) / (
+                                video_weight + audio_weight
                             )
                         self._rl_log_probs.append(policy_log_prob.detach().to(device="cpu", dtype=torch.float32))
                     if video_anchor is not None:
@@ -489,6 +499,9 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
             raise ValueError("MiniMaxH3RLPipeline requires one prompt per worker request")
         sampling = request.sampling_params
         extra = getattr(sampling, "extra_args", None) or {}
+        cps_logprob_mode = str(extra.get("cps_logprob_mode", "raw_mse"))
+        if cps_logprob_mode != self._rl_strategy.logprob_mode:
+            self._rl_strategy = CPSSDEStrategy(config=CPSSpec(logprob_mode=cps_logprob_mode))
         self._rl_recipe = self._recipe_for_request(request)
         self._rl_eta = float(getattr(sampling, "eta", 0.0) or 0.0)
         self._rl_sde_indices = [int(index) for index in extra.get("sde_indices", [])]
@@ -496,6 +509,12 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         # sibling and reproducible across retries/resume.
         self._rl_sde_sample_key = self._sde_sample_key_for_request(request) if self._rl_sde_indices else "0"
         self._rl_audio_joint_sde = bool(extra.get("audio_joint_sde", True))
+        video_weight = extra.get("av_logprob_video_weight")
+        audio_weight = extra.get("av_logprob_audio_weight")
+        if (video_weight is None) != (audio_weight is None):
+            raise ValueError("MiniMax-H3 rollout requires both AV log-prob weights or neither.")
+        self._rl_av_video_weight = None if video_weight is None else float(video_weight)
+        self._rl_av_audio_weight = None if audio_weight is None else float(audio_weight)
         self._rl_capture_transition_means = bool(extra.get("capture_transition_means", False))
         self._rl_text_embeddings = None
 

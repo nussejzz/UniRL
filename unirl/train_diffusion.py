@@ -49,6 +49,7 @@ def main(cfg: DictConfig) -> None:
         offload_train_during_reward=cfg.get("offload_train_during_reward", False),
         rollout_sleep_after_generate=cfg.get("rollout_sleep_after_generate", True),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
+        adv_min_group_std=cfg.get("adv_min_group_std", 0.0),
         accumulate_rollouts=cfg.get("accumulate_rollouts", 1),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", 64),

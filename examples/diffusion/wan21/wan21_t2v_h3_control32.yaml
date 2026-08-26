@@ -1,0 +1,72 @@
+# @package _global_
+# WAN 2.1 1.3B trainside positive control for the H3 PickScore investigation.
+# Keep 128 total samples per rollout (32 prompts x 4 samples) and PickScore
+# aligned with H3 while satisfying trainside rollout-DP=32 whole-tree sharding.
+
+defaults:
+  - wan21_t2v_dancegrpo
+  - _self_
+
+num_devices: 32
+batch_size: 32
+num_rollouts: 20
+save_interval: 5
+save_mode: auto
+save_dir: ${oc.env:H3_SAVE_DIR,checkpoints/wan21-h3-control32}
+eval_interval: 5
+eval_num_prompts: 32
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 32
+eval_eta: 0.0
+adv_use_global_std: false
+
+bundle:
+  config:
+    pretrained_model_ckpt_path: /apdcephfs_zwfy8/share_305110755/hunyuan/public_models/Wan2.1-T2V-1.3B-Diffusers
+    trajectory_precision: fp32
+    logprob_precision: fp32
+
+pipeline:
+  trajectory_precision: fp32
+  logprob_precision: fp32
+
+rollout:
+  forward_batch_size: 4
+
+data_source:
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,datasets/pickscore/train.txt}
+      eval_data_path: ${oc.env:H3_EVAL_PROMPT_FILE,datasets/pickscore/test.txt}
+      seed: 42
+      shuffle: true
+      start_batch: 0
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  num_inference_steps: 14
+  guidance_scale: 1.0
+  height: 480
+  width: 832
+  num_frames: 5
+  eta: 0.7
+  samples_per_prompt: 4
+  seed: 42
+  init_same_noise: true
+  trajectory_precision: fp32
+  logprob_precision: fp32
+
+eval_sampling:
+  num_inference_steps: 14
+  guidance_scale: 1.0
+  height: 480
+  width: 832
+  num_frames: 5
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-wan21-h3-control
+  run_name: wan21-h3-control32
+  tags: [wan21, t2v, dancegrpo, pickscore-only, h3-control, k4, trainside, 32gpu]
+  log_media: false

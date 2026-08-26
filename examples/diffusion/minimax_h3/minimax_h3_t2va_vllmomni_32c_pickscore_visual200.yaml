@@ -1,0 +1,73 @@
+# @package _global_
+# PickScore-only visual RL: K16, video-sigma-stratified policy transitions.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_quality100
+  - _self_
+
+num_rollouts: 200
+save_interval: 10
+save_mode: auto
+load_dir: ${oc.env:H3_LOAD_DIR,null}
+save_dir: ${oc.env:H3_SAVE_DIR,checkpoints/minimax-h3-pickscore-visual200}
+eval_interval: 10
+adv_use_global_std: false
+
+data_source:
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      eval_data_path: ${oc.env:H3_EVAL_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      seed: 42
+      shuffle: true
+      start_batch: ${oc.decode:${oc.env:H3_START_BATCH,0}}
+
+bundle:
+  config:
+    audio_joint_sde: false
+    trajectory_precision: fp32
+
+backend:
+  optimizer_cfg:
+    learning_rate: 2.0e-5
+
+reward:
+  backend:
+    config:
+      batch_size: 2
+      frame_selection: uniform
+      num_score_frames: 9
+      weights:
+        videopickscore: 1.0
+        clap: 0.0
+
+sampling:
+  num_inference_steps: 24
+  height: 256
+  width: 448
+  num_frames: 107
+  eta: 0.6
+  sde_indices: null
+  scheduler:
+    _target_: unirl.sde.index_schedule.SigmaBandSDEScheduler
+    num_timesteps: 24
+    shift: 12.0
+    sigma_bands:
+      - [0.85, 0.93]
+      - [0.70, 0.84]
+      - [0.50, 0.65]
+    seed: 42
+  samples_per_prompt: 16
+  trajectory_precision: fp32
+  sampler_kwargs:
+    aspect_ratio: "16:9"
+    allow_nonstandard_canvas: true
+    reward_num_frames: 9
+
+logging:
+  report_to_wandb: true
+  log_media: true
+  media_log_interval: 10
+  media_max_items: 2
+  run_name: h3-pickscore-visual200
+  tags: [minimax-h3, pickscore-only, visual-sigma-bands, k16, fp32-master]

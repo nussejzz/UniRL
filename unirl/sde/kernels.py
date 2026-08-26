@@ -246,15 +246,23 @@ class CPSSDEStrategy(SDEStrategy):
     canonical_name: ClassVar[str] = "cps"
 
     def __init__(self, *, config: Optional["CPSSpec"] = None) -> None:
-        del config
+        self.logprob_mode = str(config.logprob_mode if config is not None else "raw_mse").strip().lower()
+        if self.logprob_mode not in ("raw_mse", "gaussian"):
+            raise ValueError(f"CPSSDEStrategy.logprob_mode must be 'raw_mse' or 'gaussian'; got {self.logprob_mode!r}")
 
     def compute_log_prob(
         self,
         prev_sample: torch.Tensor,
         prev_sample_mean: torch.Tensor,
+        std_var: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return -((prev_sample.detach() - prev_sample_mean) ** 2)
+        squared_error = (prev_sample.detach() - prev_sample_mean) ** 2
+        if self.logprob_mode == "raw_mse":
+            return -squared_error
+        if bool((std_var <= 0).any()):
+            raise ValueError("Gaussian CPS log-prob requires a positive transition std; exclude deterministic steps")
+        return -squared_error / (2 * std_var**2) - torch.log(std_var) - 0.5 * math.log(2 * math.pi)
 
     def _std_dev_t(
         self,
@@ -550,7 +558,9 @@ class FlowSpec:
 
 @dataclass
 class CPSSpec:
-    """Empty Spec: CPSSDEStrategy has no per-strategy config fields."""
+    """CPS log-probability scoring mode."""
+
+    logprob_mode: str = "raw_mse"
 
 
 @dataclass

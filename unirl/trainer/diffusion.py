@@ -299,6 +299,7 @@ class DiffusionTrainer(BaseTrainer):
         offload_train_during_reward: bool = False,
         rollout_sleep_after_generate: bool = True,
         adv_use_global_std: bool = False,
+        adv_min_group_std: float = 0.0,
         accumulate_rollouts: int = 1,
         eval_interval: int = 0,
         eval_num_prompts: int = 64,
@@ -327,6 +328,9 @@ class DiffusionTrainer(BaseTrainer):
         # default preserves the historical phase-sleep behavior.
         self._rollout_sleep_after_generate = bool(rollout_sleep_after_generate)
         self._adv_use_global_std = bool(adv_use_global_std)
+        self._adv_min_group_std = float(adv_min_group_std)
+        if self._adv_min_group_std < 0:
+            raise ValueError(f"adv_min_group_std must be non-negative, got {adv_min_group_std}")
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
@@ -783,7 +787,11 @@ class DiffusionTrainer(BaseTrainer):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
             if self._algo_requires_advantages:
-                part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
+                part = part.compute_advantages(
+                    normalize=True,
+                    use_global_std=self._adv_use_global_std,
+                    min_group_std=self._adv_min_group_std,
+                )
                 sample = sample.with_parts([*sample.parts[:-1], part])
 
         # Project root-Part metadata onto the gen Part's rows (DiffusionOPD routes

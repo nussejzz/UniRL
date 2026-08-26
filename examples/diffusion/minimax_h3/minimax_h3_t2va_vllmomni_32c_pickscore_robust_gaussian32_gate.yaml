@@ -1,0 +1,55 @@
+# @package _global_
+# Integrated H3 vLLM gate: robust temporal PickScore, behavior-policy logP,
+# Gaussian-normalized CPS and broader shifted-sigma coverage.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_pickscore_visual120_fixed
+  - _self_
+
+num_rollouts: 4
+save_interval: 4
+eval_interval: 4
+
+pipeline:
+  strategy:
+    _target_: unirl.sde.kernels.CPSSDEStrategy
+    config:
+      _target_: unirl.sde.kernels.CPSSpec
+      logprob_mode: gaussian
+
+algorithm:
+  old_logp_source: rollout
+  max_rollout_replay_logp_absdiff: 1.0e-3
+  rollout_replay_parity_action: warn
+
+reward:
+  backend:
+    config:
+      frame_selection: uniform
+      num_score_frames: 9
+      frame_aggregation: topk_mean_blend
+      topk_frames: 3
+      all_frame_mean_weight: 0.25
+
+sampling:
+  num_inference_steps: 32
+  scheduler:
+    _target_: unirl.sde.index_schedule.SigmaBandSDEScheduler
+    num_timesteps: 32
+    shift: 12.0
+    sigma_bands:
+      - [0.92, 0.98]
+      - [0.79, 0.915]
+      - [0.60, 0.78]
+      - [0.40, 0.58]
+    seed: 42
+  sampler_kwargs:
+    cps_logprob_mode: gaussian
+
+eval_sampling:
+  num_inference_steps: 32
+
+logging:
+  run_name: h3-vllmomni-robust-pickscore-gaussian-cps32-gate
+  tags:
+    [minimax-h3, vllm-omni, pickscore-topk-blend, gaussian-cps, 32-step, k16, rollout-logp, gate4]

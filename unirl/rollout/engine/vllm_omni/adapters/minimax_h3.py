@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Optional
 
 import torch
 
@@ -63,11 +63,15 @@ class MiniMaxH3InputAdapter(DitInputAdapter):
         video_shift: float,
         audio_shift: float,
         audio_joint_sde: bool,
+        av_logprob_video_weight: Optional[float],
+        av_logprob_audio_weight: Optional[float],
     ) -> None:
         super().__init__(modality)
         self.video_shift = float(video_shift)
         self.audio_shift = float(audio_shift)
         self.audio_joint_sde = bool(audio_joint_sde)
+        self.av_logprob_video_weight = av_logprob_video_weight
+        self.av_logprob_audio_weight = av_logprob_audio_weight
 
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
@@ -85,7 +89,10 @@ class MiniMaxH3InputAdapter(DitInputAdapter):
             flow_shift=self.video_shift,
             audio_flow_shift=self.audio_shift,
             audio_joint_sde=self.audio_joint_sde,
+            av_logprob_video_weight=self.av_logprob_video_weight,
+            av_logprob_audio_weight=self.av_logprob_audio_weight,
             capture_transition_means=bool(sampler_kwargs.get("capture_transition_means", False)),
+            cps_logprob_mode=str(sampler_kwargs.get("cps_logprob_mode", "raw_mse")),
         )
         kwargs["extra_args"] = extra
         return sampling
@@ -371,6 +378,8 @@ class MiniMaxH3T2VAAdapter(ModelAdapter):
             video_shift=float(model_config.video_shift),
             audio_shift=float(model_config.audio_shift),
             audio_joint_sde=bool(model_config.audio_joint_sde),
+            av_logprob_video_weight=model_config.av_logprob_video_weight,
+            av_logprob_audio_weight=model_config.av_logprob_audio_weight,
         )
         self.output_adapter = MiniMaxH3OutputAdapter(
             self.modality,

@@ -1,0 +1,115 @@
+# @package _global_
+# GPU positive-control aligned to verl-omni PR #368's published H3 FlowGRPO
+# recipe. Deployment remains our 32-GPU collocated stack; policy/reward knobs
+# match the PR wherever the two frameworks expose equivalent contracts.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_pickscore_visual200_tp2_up2
+  - _self_
+
+num_rollouts: 32
+batch_size: 32
+save_interval: 8
+save_mode: auto
+save_dir: ${oc.env:H3_SAVE_DIR,checkpoints/h3-verl368-parity32}
+eval_interval: 8
+adv_use_global_std: true
+adv_min_group_std: 1.0e-4
+
+data_source:
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      eval_data_path: ${oc.env:H3_EVAL_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      seed: 42
+      shuffle: true
+      start_batch: 0
+
+bundle:
+  config:
+    audio_joint_sde: true
+    av_logprob_video_weight: 0.5
+    av_logprob_audio_weight: 0.5
+    trajectory_precision: fp32
+
+pipeline:
+  strategy:
+    _target_: unirl.sde.kernels.CPSSDEStrategy
+    config:
+      _target_: unirl.sde.kernels.CPSSpec
+      logprob_mode: raw_mse
+
+backend:
+  optimizer_cfg:
+    learning_rate: 3.0e-4
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  lora_cfg:
+    rank: 64
+    alpha: 128
+
+algorithm:
+  old_logp_source: rollout
+  clip_range: 1.0e-4
+  max_rollout_replay_logp_absdiff: 1.0e-3
+  rollout_replay_parity_action: warn
+
+stack:
+  num_updates_per_batch: 1
+
+reward:
+  backend:
+    config:
+      batch_size: 2
+      clap_model_id: /apdcephfs_zwfy8/share_305110755/hunyuan/zuhaoding/models/larger_clap_general
+      imagebind_model_path: /apdcephfs_zwfy8/share_305110755/hunyuan/zuhaoding/experiments/2026-08-22_h3-verlomni-repro/code/UniRL-repro/.checkpoints/imagebind_huge.pth
+      imagebind_mode: audio_video
+      weights:
+        videopickscore: 0.0
+        clap: 1.0
+        imagebind: 1.0
+
+sampling:
+  num_inference_steps: 24
+  height: 256
+  width: 448
+  num_frames: 107
+  eta: 0.8
+  sde_indices: null
+  scheduler:
+    _target_: unirl.sde.index_schedule.RandomContiguousSDEScheduler
+    num_timesteps: 23
+    window_size: 3
+    start: 0
+    end: 23
+    seed: 42
+  samples_per_prompt: 8
+  init_same_noise: false
+  trajectory_precision: fp32
+  sampler_kwargs:
+    aspect_ratio: "16:9"
+    allow_nonstandard_canvas: true
+    reward_num_frames: 9
+    cps_logprob_mode: raw_mse
+
+eval_num_prompts: 16
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 8
+eval_eta: 0.0
+eval_sampling:
+  num_inference_steps: 24
+  height: 256
+  width: 448
+  num_frames: 107
+  sampler_kwargs:
+    aspect_ratio: "16:9"
+    allow_nonstandard_canvas: true
+
+logging:
+  report_to_wandb: true
+  log_media: true
+  media_log_interval: 8
+  media_max_items: 2
+  run_name: h3-verl368-parity32
+  tags:
+    [minimax-h3, verl368-parity, flowgrpo, global-std, fresh-xt, raw-cps, av-joint, clap, imagebind, k8, lora64]
