@@ -262,10 +262,14 @@ class Part(Batch):
         scope: str = "group",
         use_global_std: bool = False,
         group_layer: Optional[int] = None,
+        min_group_std: float = 0.0,
     ) -> "Part":
-        """GRPO per-group advantage ``(reward - group_mean) / (group_std + eps)``."""
+        """Compute GRPO group advantages, optionally suppressing unresolved reward spread."""
         if self.rewards is None:
             raise ValueError("Part.compute_advantages: part has no rewards")
+        min_group_std = float(min_group_std)
+        if min_group_std < 0:
+            raise ValueError(f"min_group_std must be non-negative, got {min_group_std}")
         n = len(self.sample_ids)
         if n == 0:
             return self
@@ -315,7 +319,28 @@ class Part(Batch):
             else:
                 variance = (centered * centered).sum(dim=1, keepdim=True) / counts.clamp_min(1)
                 std = torch.where(counts > 1, variance.sqrt(), torch.ones_like(variance))
+                # Raw within-group reward spread separates policy-attributable
+                # signal from RM/x_T noise; the normalized advantages cannot.
+                spread = std.flatten()
+                logger.info(
+                    "group reward spread: n_groups=%d branch=%d std mean=%.5f min=%.5f max=%.5f",
+                    n_groups,
+                    branch,
+                    float(spread.mean()),
+                    float(spread.min()),
+                    float(spread.max()),
+                )
             adv = centered / (std + eps)
+            if not use_global_std and min_group_std > 0:
+                low_signal = (counts > 1) & (std < min_group_std)
+                if low_signal.any():
+                    logger.warning(
+                        "zeroing advantages for %d/%d groups below min_group_std=%.6g",
+                        int(low_signal.sum()),
+                        n_groups,
+                        min_group_std,
+                    )
+                    adv = torch.where(low_signal, torch.zeros_like(adv), adv)
         else:
             adv = centered
         return _part_with_field(self, "advantages", adv.flatten())
