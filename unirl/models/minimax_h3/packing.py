@@ -67,16 +67,37 @@ class MiniMaxH3Geometry:
         )
 
     @classmethod
-    def resolve(cls, *, height: int, width: int, num_frames: int) -> "MiniMaxH3Geometry":
+    def resolve(
+        cls,
+        *,
+        height: int,
+        width: int,
+        num_frames: int,
+        allow_nonstandard_canvas: bool = False,
+    ) -> "MiniMaxH3Geometry":
         """Validate a requested ``(height, width, num_frames)`` against H3."""
-        canvas_height, canvas_width = resolve_canvas_size(float(width), float(height))
-        if (int(height), int(width)) != (canvas_height, canvas_width):
-            raise ValueError(
-                f"MiniMaxH3Geometry: height={height} width={width} is not a MiniMax-H3 canvas. The model was "
-                f"released for a 768 pixel short edge with both axes a multiple of 32; for this aspect ratio the "
-                f"only legal canvas is height={canvas_height} width={canvas_width}. There is no smaller setting "
-                f"for a cheaper run -- 768x768 for 5s (~22k packed rows) is the floor."
-            )
+        height, width = int(height), int(width)
+        if allow_nonstandard_canvas:
+            ratio = width / height
+            if min(height, width) < 256 or height % 32 or width % 32:
+                raise ValueError(
+                    "MiniMaxH3Geometry experimental canvas requires both axes to be multiples of 32 "
+                    f"with a short edge >= 256, got {width}x{height}."
+                )
+            if not 0.25 <= ratio <= 4.0 or height * width > 768 * 1344:
+                raise ValueError(
+                    f"MiniMaxH3Geometry experimental canvas is outside the supported ratio/area bound: {width}x{height}."
+                )
+            canvas_height, canvas_width = height, width
+        else:
+            canvas_height, canvas_width = resolve_canvas_size(float(width), float(height))
+            if (height, width) != (canvas_height, canvas_width):
+                raise ValueError(
+                    f"MiniMaxH3Geometry: height={height} width={width} is not a MiniMax-H3 canvas. The model was "
+                    f"released for a 768 pixel short edge with both axes a multiple of 32; for this aspect ratio the "
+                    f"only legal canvas is height={canvas_height} width={canvas_width}. Set "
+                    "sampler_kwargs.allow_nonstandard_canvas=true only for an explicitly qualified low-resolution run."
+                )
         aligned = align_num_frames(int(num_frames))
         if aligned != int(num_frames):
             raise ValueError(
@@ -97,7 +118,13 @@ class MiniMaxH3Geometry:
     @classmethod
     def from_params(cls, params) -> "MiniMaxH3Geometry":
         """Resolve from a ``DiffusionSamplingParams``-shaped object."""
-        return cls.resolve(height=int(params.height), width=int(params.width), num_frames=int(params.num_frames))
+        sampler_kwargs = dict(getattr(params, "sampler_kwargs", {}) or {})
+        return cls.resolve(
+            height=int(params.height),
+            width=int(params.width),
+            num_frames=int(params.num_frames),
+            allow_nonstandard_canvas=bool(sampler_kwargs.get("allow_nonstandard_canvas", False)),
+        )
 
 
 def build_t2va_layout(geometry: MiniMaxH3Geometry, num_text_tokens: int) -> MiniMaxH3PackedSequence:

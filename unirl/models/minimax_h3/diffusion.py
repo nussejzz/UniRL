@@ -13,6 +13,7 @@ from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.sde.runtime import get_sigma_schedule
+from unirl.types.conditions import TextEmbedCondition
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -96,6 +97,28 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
 
+    @staticmethod
+    def _trim_padded_text(conditions: MiniMaxH3Conditions) -> MiniMaxH3Conditions:
+        text = conditions.text
+        if text is None or text.embeds is None or text.attn_mask is None:
+            return conditions
+        lengths = text.attn_mask.to(dtype=torch.long).sum(dim=1)
+        require(
+            int(lengths.numel()) == 1,
+            f"MiniMax-H3 text trimming requires batch-1, got lengths={lengths.tolist()}",
+        )
+        text_len = int(lengths[0].item())
+        require(text_len > 0, "MiniMax-H3 text attention mask selects no tokens")
+        if text_len == int(text.embeds.shape[1]):
+            return conditions
+        return MiniMaxH3Conditions(
+            text=TextEmbedCondition(
+                embeds=text.embeds[:, :text_len],
+                pooled=text.pooled,
+                attn_mask=text.attn_mask[:, :text_len],
+            )
+        )
+
     def trainable_module(self) -> torch.nn.Module:
         return self.bundle.transformer
 
@@ -135,6 +158,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             f"unbatched per-row metadata, so callers chunk instead: set rollout.forward_batch_size=1 and "
             f"stack.micro_batch_size=1. Mirrors the bagel navit recipe.",
         )
+        conditions = self._trim_padded_text(conditions)
         num_text_tokens = int(conditions.text.embeds.shape[1])
         layout = build_t2va_layout(geometry, num_text_tokens)
         audio_sigmas = self.audio_schedule(sigmas)
@@ -221,6 +245,12 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                         )
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
+        # Decode/NFT always need the clean terminal video/audio latent, even
+        # when sparse GRPO replay stores only earlier SDE boundaries.
+        if not stored_pairs or stored_pairs[-1][0] != num_steps:
+            stored_pairs.append((num_steps, x.detach().clone()))
+            stored_audio.append(a.detach().clone())
+
         positions = [p for p, _ in stored_pairs]
         return make_video_segment(
             latents=torch.stack([t for _, t in stored_pairs], dim=1),
@@ -261,6 +291,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         if geometry is None:
             geometry = MiniMaxH3Geometry.from_params(params)
 
+        conditions = self._trim_padded_text(conditions)
         sigmas = segment.sigmas.to(self.bundle.device)
         audio_sigmas = self.audio_schedule(sigmas)
         num_text_tokens = int(conditions.text.embeds.shape[1])
