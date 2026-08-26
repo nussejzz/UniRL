@@ -1,0 +1,18 @@
+# @package _global_
+# H3 trainside Gaussian-normalized CPS probe. Sampling is unchanged; only the
+# transition log-probability uses its actual per-step Gaussian variance.
+
+defaults:
+  - minimax_h3_t2va_trainside_control32
+  - _self_
+
+pipeline:
+  strategy:
+    _target_: unirl.sde.kernels.CPSSDEStrategy
+    config:
+      _target_: unirl.sde.kernels.CPSSpec
+      logprob_mode: gaussian
+
+logging:
+  run_name: h3-trainside-gaussian-cps-probe32
+  tags: [minimax-h3, trainside, gaussian-cps, pickscore-only, k16, shared-xt, 32gpu]

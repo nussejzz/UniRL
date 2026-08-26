@@ -1,0 +1,15 @@
+# @package _global_
+# Strict A/B against the shared-x_T integrated gate. The only algorithmic
+# change is independent initial noise for every sibling sample.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_pickscore_robust_gaussian32_gate
+  - _self_
+
+sampling:
+  init_same_noise: false
+
+logging:
+  run_name: h3-vllmomni-robust-gaussian32-independent-xt-gate
+  tags:
+    [minimax-h3, vllm-omni, independent-xt, pickscore-topk-blend, gaussian-cps, 32-step, k16, gate4]

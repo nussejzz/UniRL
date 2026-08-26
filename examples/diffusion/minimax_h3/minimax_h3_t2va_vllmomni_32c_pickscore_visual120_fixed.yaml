@@ -1,0 +1,23 @@
+# @package _global_
+# Corrected PickScore-only H3 run: shared x_T, stable sibling SDE keys,
+# low-information advantage gating, and warning-only production parity.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_pickscore_visual200_tp2_up2
+  - _self_
+
+num_rollouts: 120
+save_interval: 5
+eval_interval: 10
+adv_min_group_std: 1.0e-4
+
+algorithm:
+  rollout_replay_parity_action: warn
+
+sampling:
+  init_same_noise: true
+
+logging:
+  run_name: h3-pickscore-visual120-fixed
+  tags:
+    [minimax-h3, pickscore-only, visual-sigma-bands, k16, shared-xt, stable-sde-key, fixed120]

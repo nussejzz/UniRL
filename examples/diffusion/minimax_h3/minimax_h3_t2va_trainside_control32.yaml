@@ -1,0 +1,95 @@
+# @package _global_
+# H3 trainside isolation arm: preserve the corrected vLLM recipe's raw-CPS,
+# K16, low-resolution geometry and PickScore while removing rollout/sync drift.
+
+defaults:
+  - minimax_h3_t2va_trainside
+  - _self_
+
+num_devices: 32
+batch_size: 32
+num_rollouts: 20
+save_interval: 5
+save_mode: auto
+save_dir: ${oc.env:H3_SAVE_DIR,checkpoints/minimax-h3-trainside-control32}
+eval_interval: 5
+eval_num_prompts: 32
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 32
+eval_eta: 0.0
+adv_use_global_std: false
+adv_min_group_std: 1.0e-4
+
+bundle:
+  config:
+    pretrained_model_ckpt_path: /apdcephfs_zwfy8/share_305110755/hunyuan/public_models/MiniMax-H3
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    audio_joint_sde: false
+
+backend:
+  optimizer_cfg:
+    learning_rate: 2.0e-5
+
+reward:
+  backend:
+    config:
+      batch_size: 2
+      frame_selection: uniform
+      num_score_frames: 9
+      weights:
+        videopickscore: 1.0
+        clap: 0.0
+
+algorithm:
+  old_logp_source: replay
+
+data_source:
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,datasets/pickscore/train.txt}
+      eval_data_path: ${oc.env:H3_EVAL_PROMPT_FILE,datasets/pickscore/test.txt}
+      seed: 42
+      shuffle: true
+      start_batch: 0
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  num_inference_steps: 24
+  height: 256
+  width: 448
+  num_frames: 107
+  eta: 0.6
+  sde_indices: null
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: true
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.sde.index_schedule.SigmaBandSDEScheduler
+    num_timesteps: 24
+    shift: 12.0
+    sigma_bands:
+      - [0.85, 0.93]
+      - [0.70, 0.84]
+      - [0.50, 0.65]
+    seed: 42
+  sampler_kwargs:
+    allow_nonstandard_canvas: true
+
+eval_sampling:
+  num_inference_steps: 24
+  height: 256
+  width: 448
+  num_frames: 107
+  sampler_kwargs:
+    allow_nonstandard_canvas: true
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-minimax-h3-t2va
+  run_name: h3-trainside-control32
+  tags: [minimax-h3, trainside, raw-cps, pickscore-only, k16, shared-xt, 32gpu]
+  log_media: false

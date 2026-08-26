@@ -1,0 +1,16 @@
+# @package _global_
+# WAN positive-control arm with the same K16 group size as H3. Trainside
+# rollout-DP=32 requires 32 root prompts, yielding 512 total samples.
+
+defaults:
+  - wan21_t2v_h3_control32
+  - _self_
+
+adv_use_global_std: true
+
+sampling:
+  samples_per_prompt: 16
+
+logging:
+  run_name: wan21-h3-control32-k16
+  tags: [wan21, t2v, dancegrpo, pickscore-only, h3-control, k16, global-std, trainside, 32gpu]

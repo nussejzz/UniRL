@@ -28,10 +28,14 @@ def _combine_modality_logp(
     audio_logp: torch.Tensor,
     n_video: int,
     n_audio: int,
+    video_weight: Optional[float] = None,
+    audio_weight: Optional[float] = None,
 ) -> torch.Tensor:
-    """Element-weighted mean of the per-step video/audio log-probs."""
-    total = n_video + n_audio
-    return (video_logp * n_video + audio_logp * n_audio) / total
+    """Combine per-modality mean log densities."""
+    if video_weight is None or audio_weight is None:
+        video_weight, audio_weight = float(n_video), float(n_audio)
+    total = float(video_weight) + float(audio_weight)
+    return (video_logp * float(video_weight) + audio_logp * float(audio_weight)) / total
 
 
 class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]):
@@ -84,6 +88,8 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         *,
         audio_shift: float,
         audio_joint_sde: bool = True,
+        av_logprob_video_weight: Optional[float] = None,
+        av_logprob_audio_weight: Optional[float] = None,
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
@@ -93,6 +99,8 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         self.strategy = strategy
         self.audio_shift = float(audio_shift)
         self.audio_joint_sde = bool(audio_joint_sde)
+        self.av_logprob_video_weight = av_logprob_video_weight
+        self.av_logprob_audio_weight = av_logprob_audio_weight
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
@@ -241,7 +249,12 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                 if log_prob is not None:
                     if audio_in_policy and audio_log_prob is not None:
                         log_prob = _combine_modality_logp(
-                            log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
+                            log_prob,
+                            audio_log_prob,
+                            n_video=x[0].numel(),
+                            n_audio=a[0].numel(),
+                            video_weight=self.av_logprob_video_weight,
+                            audio_weight=self.av_logprob_audio_weight,
                         )
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
@@ -338,7 +351,12 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                     )
                     if audio_log_prob is not None:
                         log_prob = _combine_modality_logp(
-                            log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
+                            log_prob,
+                            audio_log_prob,
+                            n_video=x[0].numel(),
+                            n_audio=a[0].numel(),
+                            video_weight=self.av_logprob_video_weight,
+                            audio_weight=self.av_logprob_audio_weight,
                         )
                 log_probs.append(log_prob.to(dtype=self.logprob_dtype))
                 means.append(mean)
